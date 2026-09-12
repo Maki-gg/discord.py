@@ -240,7 +240,9 @@ class CacheSettings:
         Maximum guilds kept fully loaded in memory. Beyond it the least recently used guild is
         unloaded and restored from Redis before its next event is processed. Requires ``redis``.
     redis: Optional[:class:`RedisSettings`]
-        Enables the Redis tier.
+        Enables the Redis tier. Its ``member_ttl``, ``thread_ttl`` and ``message_ttl`` must each be
+        at least as long as the matching setting here, since Redis is the fallback once memory
+        forgets something. Raises :exc:`ValueError` otherwise.
     """
 
     __slots__ = (
@@ -280,6 +282,23 @@ class CacheSettings:
             raise ValueError('sweep_interval must be positive')
         if max_loaded_guilds is not None and redis is None:
             raise TypeError('max_loaded_guilds requires redis=RedisSettings(...)')
+
+        if redis is not None:
+            # The Redis copy is the fallback once memory forgets something, so it must
+            # outlive (or at least match) the in-memory TTL for the same entity. If Redis
+            # expired it first, a guild reload silently comes back missing entries.
+            for name, mem_ttl, redis_ttl in (
+                ('member', member_ttl, redis.member_ttl),
+                ('thread', thread_ttl, redis.thread_ttl),
+                ('message', message_ttl, redis.message_ttl),
+            ):
+                if mem_ttl is not None and redis_ttl is not None and redis_ttl < mem_ttl:
+                    raise ValueError(
+                        f'redis.{name}_ttl ({redis_ttl}s) is lower than {name}_ttl ({mem_ttl}s); '
+                        f'the Redis copy would expire before the in-memory one, so unloading a guild '
+                        f'or fetching a cached {name} could silently return stale or missing data. '
+                        f'Set redis.{name}_ttl to at least {mem_ttl}.'
+                    )
 
         self.member_ttl: Optional[float] = member_ttl
         self.member_max: Optional[int] = member_max

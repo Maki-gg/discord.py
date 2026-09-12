@@ -229,6 +229,9 @@ Caveats
   and unloaded guilds are restored from the API instead.
 * Message mirroring is high volume; only set ``RedisSettings.message_ttl`` if you need deleted or edited
   message content after it left memory.
+* ``CacheSettings`` validates that ``redis.member_ttl``, ``redis.thread_ttl`` and ``redis.message_ttl``
+  are each at least as long as the matching in-memory TTL, since Redis is the fallback tier. Widen the
+  Redis TTL rather than shrinking the in-memory one if this raises.
 
 Links
 ------

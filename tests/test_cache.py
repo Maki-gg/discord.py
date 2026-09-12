@@ -196,10 +196,31 @@ GUILD_CREATE = {
     'owner_id': '2',
     'member_count': 2,
     'features': [],
-    'roles': [{'id': '1', 'name': '@everyone', 'permissions': '0', 'position': 0, 'color': 0, 'hoist': False, 'managed': False, 'mentionable': False}],
+    'roles': [
+        {
+            'id': '1',
+            'name': '@everyone',
+            'permissions': '0',
+            'position': 0,
+            'color': 0,
+            'hoist': False,
+            'managed': False,
+            'mentionable': False,
+        }
+    ],
     'emojis': [],
     'stickers': [],
-    'channels': [{'id': '20', 'type': 0, 'name': 'general', 'position': 0, 'permission_overwrites': [], 'nsfw': False, 'parent_id': None}],
+    'channels': [
+        {
+            'id': '20',
+            'type': 0,
+            'name': 'general',
+            'position': 0,
+            'permission_overwrites': [],
+            'nsfw': False,
+            'parent_id': None,
+        }
+    ],
     'threads': [],
     'members': [
         {
@@ -245,7 +266,17 @@ def make_client(**cache_kwargs: Any) -> discord.Client:
     state = client._connection
     state.user = discord.ClientUser(
         state=state,
-        data={'id': '999', 'username': 'bot', 'discriminator': '0', 'avatar': None, 'global_name': None, 'bot': True, 'verified': True, 'mfa_enabled': False, 'flags': 0},  # type: ignore
+        data={
+            'id': '999',
+            'username': 'bot',
+            'discriminator': '0',
+            'avatar': None,
+            'global_name': None,
+            'bot': True,
+            'verified': True,
+            'mfa_enabled': False,
+            'flags': 0,
+        },  # type: ignore
     )
     return client
 
@@ -406,6 +437,22 @@ def test_settings_validation() -> None:
     assert 'member_ttl' in repr(CacheSettings(member_ttl=5))
 
 
+def test_settings_rejects_redis_ttl_shorter_than_memory_ttl() -> None:
+    # member_ttl: Redis defaults to 6h, which is too short for a 1 day in-memory TTL.
+    with pytest.raises(ValueError, match='member_ttl'):
+        CacheSettings(member_ttl=86400, redis=RedisSettings('redis://x', cluster=False))
+    # thread_ttl: Redis defaults to 1h.
+    with pytest.raises(ValueError, match='thread_ttl'):
+        CacheSettings(thread_ttl=7200, redis=RedisSettings('redis://x', cluster=False))
+    # message_ttl: only checked when Redis actually mirrors messages.
+    CacheSettings(message_ttl=7200, redis=RedisSettings('redis://x', cluster=False))  # redis message_ttl is None: fine
+    with pytest.raises(ValueError, match='message_ttl'):
+        CacheSettings(message_ttl=7200, redis=RedisSettings('redis://x', cluster=False, message_ttl=3600))
+    # equal TTLs and an explicitly longer Redis TTL are both fine.
+    CacheSettings(member_ttl=21600, redis=RedisSettings('redis://x', cluster=False))
+    CacheSettings(member_ttl=3600, redis=RedisSettings('redis://x', cluster=False, member_ttl=21600))
+
+
 # ---------------------------------------------------------------------------
 # Redis mirror table
 # ---------------------------------------------------------------------------
@@ -421,7 +468,12 @@ async def run_mirror(rc: RedisCache, event: str, data: Dict[str, Any]) -> FakeRe
 @pytest.mark.asyncio
 async def test_mirror_guild_create_and_hash_tags() -> None:
     rc = redis_cache(serve_fetches=True, thread_ttl=77)
-    payload = dict(GUILD_CREATE, threads=[{'id': '30', 'guild_id': '1', 'type': 11, 'name': 't', 'parent_id': '20', 'thread_metadata': {'archived': False}}])
+    payload = dict(
+        GUILD_CREATE,
+        threads=[
+            {'id': '30', 'guild_id': '1', 'type': 11, 'name': 't', 'parent_id': '20', 'thread_metadata': {'archived': False}}
+        ],
+    )
     fake = await run_mirror(rc, 'GUILD_CREATE', payload)
     assert fake.string('guild:{1}')['name'] == 'guild' and 'members' not in fake.string('guild:{1}')
     assert set(fake.hash('guild:{1}:roles')) == {'1'} and set(fake.hash('guild:{1}:channels')) == {'20'}
@@ -785,7 +837,18 @@ async def test_client_cached_lookups_fall_back_to_redis(clock: Clock) -> None:
     guild = client.get_guild(1)
     assert guild is not None
 
-    await cache.pre_event('GUILD_MEMBER_ADD', {'guild_id': '1', 'user': {'id': '3', 'username': 'three', 'discriminator': '0', 'avatar': None, 'global_name': None}, 'roles': [], 'joined_at': None, 'deaf': False, 'mute': False, 'flags': 0})
+    await cache.pre_event(
+        'GUILD_MEMBER_ADD',
+        {
+            'guild_id': '1',
+            'user': {'id': '3', 'username': 'three', 'discriminator': '0', 'avatar': None, 'global_name': None},
+            'roles': [],
+            'joined_at': None,
+            'deaf': False,
+            'mute': False,
+            'flags': 0,
+        },
+    )
     await cache.pre_event('MESSAGE_CREATE', dict(MESSAGE_CREATE))
     await cache.flush()
 
