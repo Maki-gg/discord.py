@@ -133,9 +133,12 @@ What changed
   activity, or beyond ``member_max`` / ``thread_max`` entries per guild. The bot's own member is never evicted.
 * The message cache is keyed by id (O(1) lookups) and evicts messages after ``message_ttl`` seconds.
   ``max_messages`` still bounds its size.
-* Optional Redis tier via ``RedisSettings`` (Redis Cluster by default). Guild data is mirrored to Redis
-  from a single gateway hook. With ``max_loaded_guilds`` the least recently used guilds are unloaded from
-  memory and restored from Redis (or the API) before their next event is processed.
+* Optional Redis tier via ``RedisSettings``. It behaves as an extension of the in-memory cache for older
+  data: guild data, members and (optionally) messages are mirrored to Redis from a single gateway hook, and
+  when an incoming event refers to a member or message that memory already evicted, it is restored from
+  Redis before the event is handled. ``on_message_delete``, ``on_message_edit``, ``on_member_update``,
+  ``on_member_remove``, reactions and polls therefore fire exactly as they would with everything in memory.
+  With ``max_loaded_guilds`` whole guilds are unloaded from memory and restored the same way.
 * Coroutine helpers in ``discord.cache``: ``get_cached_user``, ``get_cached_member``,
   ``get_cached_message``, ``is_guild_loaded`` and ``load_guild``.
 
@@ -179,15 +182,16 @@ With the Redis tier and guild unloading (``pip install -U "discord.py[redis]"``)
             max_loaded_guilds=4_000,
             redis=discord.RedisSettings(
                 ['redis://node1:6379', 'redis://node2:6379', 'redis://node3:6379'],
-                message_ttl=3600,     # keep deleted/edited message content readable for an hour
-                serve_fetches=True,   # also mirror members and users for get_cached_member/user
+                member_ttl=24 * 3600,   # members live a day in Redis after leaving memory
+                message_ttl=24 * 3600,  # same for messages (None keeps messages out of Redis)
             ),
         ),
     )
 
     @bot.event
-    async def on_raw_message_delete(payload):
-        message = await discord.cache.get_cached_message(bot, payload.channel_id, payload.message_id)
+    async def on_message_delete(message):
+        # fires even if the message left memory hours ago, as long as Redis still has it
+        ...
 
 Pass ``cluster=False`` to ``RedisSettings`` for a standalone Redis server.
 
@@ -224,11 +228,15 @@ Caveats
   members are evicted. Use ``chunk_guilds_at_startup=False`` with ``member_ttl``.
 * ``Client.guilds`` still lists unloaded guilds; their channels, roles and members are empty until
   ``load_guild`` runs. Guild events trigger that automatically.
-* ``fetch_*`` methods still always hit the API. Use the ``discord.cache`` helpers for Redis-backed lookups.
+* ``fetch_*`` methods still always hit the API. Synchronous lookups such as ``guild.get_member`` only see
+  memory; use the ``discord.cache`` helpers (``get_cached_member``, ``get_cached_user``,
+  ``get_cached_message``) for an awaitable lookup that falls back to Redis.
+* Restoring from Redis happens only for gateway events (one round trip on a memory miss). Presence and
+  typing events restore members too, so with those intents enabled expect extra Redis reads.
 * If Redis is unreachable at startup the client raises. If it fails later, mirroring pauses for 30 seconds
   and unloaded guilds are restored from the API instead.
-* Message mirroring is high volume; only set ``RedisSettings.message_ttl`` if you need deleted or edited
-  message content after it left memory.
+* Message mirroring is high volume; only set ``RedisSettings.message_ttl`` if you need message events to
+  keep working after a message left memory.
 * ``CacheSettings`` validates that ``redis.member_ttl``, ``redis.thread_ttl`` and ``redis.message_ttl``
   are each at least as long as the matching in-memory TTL, since Redis is the fallback tier. Widen the
   Redis TTL rather than shrinking the in-memory one if this raises.

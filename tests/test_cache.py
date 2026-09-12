@@ -467,7 +467,7 @@ async def run_mirror(rc: RedisCache, event: str, data: Dict[str, Any]) -> FakeRe
 
 @pytest.mark.asyncio
 async def test_mirror_guild_create_and_hash_tags() -> None:
-    rc = redis_cache(serve_fetches=True, thread_ttl=77)
+    rc = redis_cache(thread_ttl=77)
     payload = dict(
         GUILD_CREATE,
         threads=[
@@ -495,8 +495,8 @@ async def test_mirror_guild_create_and_hash_tags() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mirror_guild_create_skips_unavailable_and_members_without_serve_fetches() -> None:
-    rc = redis_cache()
+async def test_mirror_guild_create_skips_unavailable_and_members_without_member_ttl() -> None:
+    rc = redis_cache(member_ttl=None)
     fake = await run_mirror(rc, 'GUILD_CREATE', {'id': '5', 'unavailable': True})
     assert fake.data == {}
     fake = await run_mirror(rc, 'GUILD_CREATE', GUILD_CREATE)
@@ -505,7 +505,7 @@ async def test_mirror_guild_create_skips_unavailable_and_members_without_serve_f
 
 @pytest.mark.asyncio
 async def test_mirror_sub_entities() -> None:
-    rc = redis_cache(serve_fetches=True)
+    rc = redis_cache()
     fake = await run_mirror(rc, 'GUILD_CREATE', GUILD_CREATE)
     await run_mirror(rc, 'CHANNEL_CREATE', {'id': '21', 'guild_id': '1', 'type': 0, 'name': 'new'})
     await run_mirror(rc, 'CHANNEL_DELETE', {'id': '20', 'guild_id': '1', 'type': 0})
@@ -553,6 +553,11 @@ async def test_mirror_messages_merge_partial_update() -> None:
     data = await rc.get_message(20, 10)
     assert data is not None and data['content'] == 'edited' and data['author']['id'] == '2'
     assert await rc.get_message(20, 11) is None
+    await run_mirror(rc, 'MESSAGE_DELETE', {'id': '10', 'channel_id': '20'})
+    assert await rc.get_message(20, 10) is None
+    await run_mirror(rc, 'MESSAGE_CREATE', MESSAGE_CREATE)
+    await run_mirror(rc, 'MESSAGE_DELETE_BULK', {'ids': ['10', '11'], 'channel_id': '20'})
+    assert await rc.get_message(20, 10) is None
 
     without = redis_cache()
     fake = await run_mirror(without, 'MESSAGE_CREATE', MESSAGE_CREATE)
@@ -829,7 +834,7 @@ async def test_client_guild_unload_and_reload_from_redis(clock: Clock) -> None:
 
 @pytest.mark.asyncio
 async def test_client_cached_lookups_fall_back_to_redis(clock: Clock) -> None:
-    client = make_client(redis=RedisSettings('redis://x', cluster=False, serve_fetches=True, message_ttl=60))
+    client = make_client(redis=RedisSettings('redis://x', cluster=False, message_ttl=60))
     state = client._connection
     cache = state._cache
     fake = await connect_fake(cache)
@@ -863,4 +868,181 @@ async def test_client_cached_lookups_fall_back_to_redis(clock: Clock) -> None:
 
     fake.fail = True
     assert await cache_mod.get_cached_member(guild, 4) is None and cache._redis_down_until > clock.now
+    await cache.close()
+
+
+def capture_dispatch(state: Any) -> List[tuple]:
+    events: List[tuple] = []
+
+    def dispatch(event: str, *args: Any) -> None:
+        events.append((event, *args))
+
+    state.dispatch = dispatch
+    return events
+
+
+@pytest.mark.asyncio
+async def test_redis_hydrates_evicted_messages_and_members_before_events(clock: Clock) -> None:
+    client = make_client(
+        member_ttl=10, message_ttl=10, sweep_interval=10_000, redis=RedisSettings('redis://x', cluster=False, message_ttl=60)
+    )
+    state = client._connection
+    cache = state._cache
+    fake = await connect_fake(cache)
+    events = capture_dispatch(state)
+
+    async def gateway(event: str, data: Dict[str, Any]) -> None:
+        await cache.pre_event(event, data)
+        state.parsers[event](data)
+
+    await gateway('GUILD_CREATE', dict(GUILD_CREATE))
+    await gateway('MESSAGE_CREATE', dict(MESSAGE_CREATE))
+    await gateway('MESSAGE_CREATE', dict(MESSAGE_CREATE, id='11', content='second'))
+    guild = client.get_guild(1)
+    assert guild is not None and guild.get_member(2) is not None and state._get_message(10) is not None
+
+    # everything ages out of memory, Redis still has it
+    clock.advance(11)
+    await cache.sweep_once()
+    assert guild.get_member(2) is None and state._get_message(10) is None and state._get_message(11) is None
+    events.clear()
+
+    # message delete: on_message_delete fires with the full message, Redis copy is removed too
+    await gateway('MESSAGE_DELETE', {'id': '10', 'channel_id': '20', 'guild_id': '1'})
+    names = [e[0] for e in events]
+    assert names == ['raw_message_delete', 'message_delete']
+    assert events[0][1].cached_message is not None and events[1][1].content == 'hello'
+    assert isinstance(events[1][1].author, discord.Member) and events[1][1].guild is guild
+    assert state._get_message(10) is None
+    await cache.flush()
+    assert 'message:{20}:10' not in fake.data
+    events.clear()
+
+    # message edit: before/after both available
+    await gateway('MESSAGE_UPDATE', dict(MESSAGE_CREATE, id='11', content='edited'))
+    names = [e[0] for e in events]
+    assert names == ['raw_message_edit', 'message_edit']
+    before, after = events[1][1], events[1][2]
+    assert before.content == 'second' and after.content == 'edited' and state._get_message(11) is not None
+    events.clear()
+
+    # reaction without a member in the payload: message and member are both restored
+    clock.advance(11)
+    await cache.sweep_once()
+    assert guild.get_member(2) is None and state._get_message(11) is None
+    await gateway(
+        'MESSAGE_REACTION_REMOVE',
+        {
+            'message_id': '11',
+            'channel_id': '20',
+            'guild_id': '1',
+            'user_id': '2',
+            'emoji': {'id': None, 'name': 'x'},
+            'type': 0,
+            'burst': False,
+        },
+    )
+    assert [e[0] for e in events] == ['raw_reaction_remove']  # no reaction to remove yet, but no crash
+    assert guild.get_member(2) is not None and state._get_message(11) is not None
+    events.clear()
+
+    # member update after eviction: on_member_update fires with the old state
+    clock.advance(11)
+    await cache.sweep_once()
+    assert guild.get_member(2) is None
+    await gateway(
+        'GUILD_MEMBER_UPDATE',
+        {
+            'guild_id': '1',
+            'user': MESSAGE_CREATE['author'],
+            'roles': [],
+            'nick': 'renamed',
+            'joined_at': '2024-01-01T00:00:00+00:00',
+            'flags': 0,
+        },
+    )
+    assert [e[0] for e in events] == ['member_update']
+    old, new = events[0][1], events[0][2]
+    assert old.nick is None and new.nick == 'renamed' and guild.get_member(2) is new
+    events.clear()
+
+    # bulk delete after eviction
+    clock.advance(11)
+    await cache.sweep_once()
+    await gateway('MESSAGE_DELETE_BULK', {'ids': ['11', '12'], 'channel_id': '20', 'guild_id': '1'})
+    names = [e[0] for e in events]
+    assert names == ['raw_bulk_message_delete', 'bulk_message_delete']
+    assert [m.id for m in events[1][1]] == [11] and state._get_message(11) is None
+    events.clear()
+
+    # member remove after eviction: on_member_remove fires with the Member and Redis forgets it
+    clock.advance(11)
+    await cache.sweep_once()
+    assert guild.get_member(2) is None
+    await gateway('GUILD_MEMBER_REMOVE', {'guild_id': '1', 'user': MESSAGE_CREATE['author']})
+    names = [e[0] for e in events]
+    assert names == ['member_remove', 'raw_member_remove'] and isinstance(events[0][1], discord.Member)
+    assert guild.get_member(2) is None
+    await cache.flush()
+    assert 'member:{1}:2' not in fake.data
+    events.clear()
+
+    # payload that already carries the member does not touch Redis
+    executed = fake.executed
+    await gateway(
+        'MESSAGE_REACTION_ADD',
+        {
+            'message_id': '99',
+            'channel_id': '20',
+            'guild_id': '1',
+            'user_id': '3',
+            'emoji': {'id': None, 'name': 'x'},
+            'type': 0,
+            'burst': False,
+            'member': {
+                'user': {'id': '3', 'username': 'u3', 'discriminator': '0', 'avatar': None, 'global_name': None},
+                'roles': [],
+                'joined_at': None,
+                'deaf': False,
+                'mute': False,
+                'flags': 0,
+            },
+        },
+    )
+    await cache.flush()
+    assert fake.executed == executed + 1  # only the message lookup, no member GET
+    events.clear()
+
+    # Redis down: events still fire in their raw form, nothing raises
+    fake.fail = True
+    await gateway('MESSAGE_DELETE', {'id': '11', 'channel_id': '20', 'guild_id': '1'})
+    assert [e[0] for e in events] == ['raw_message_delete'] and cache._redis_down_until > clock.now
+    await cache.close()
+
+
+@pytest.mark.asyncio
+async def test_redis_member_hydration_respects_member_cache_flags() -> None:
+    client = make_client(member_ttl=10, redis=RedisSettings('redis://x', cluster=False))
+    state = client._connection
+    cache = state._cache
+    fake = await connect_fake(cache)
+    state.parse_guild_create(dict(GUILD_CREATE))  # type: ignore
+    await cache.pre_event('GUILD_CREATE', dict(GUILD_CREATE))
+    await cache.flush()
+    assert 'member:{1}:2' in fake.data
+    guild = client.get_guild(1)
+    assert guild is not None
+    guild._remove_member(guild.get_member(2))  # type: ignore
+
+    state.member_cache_flags = discord.MemberCacheFlags.none()
+    await cache.pre_event(
+        'GUILD_MEMBER_UPDATE', {'guild_id': '1', 'user': MESSAGE_CREATE['author'], 'roles': [], 'flags': 0}
+    )
+    assert guild.get_member(2) is None  # upstream would not have cached it either
+
+    state.member_cache_flags = discord.MemberCacheFlags.all()
+    await cache.pre_event(
+        'GUILD_MEMBER_UPDATE', {'guild_id': '1', 'user': MESSAGE_CREATE['author'], 'roles': [], 'flags': 0}
+    )
+    assert guild.get_member(2) is not None
     await cache.close()

@@ -122,17 +122,18 @@ class RedisSettings:
         Same for the emoji collection. Defaults to one day.
     sticker_ttl: :class:`int`
         Same for the sticker collection. Defaults to one day.
-    member_ttl: :class:`int`
-        Seconds a member entry stays in Redis. Only written when ``serve_fetches`` is on.
-        Defaults to six hours.
+    member_ttl: Optional[:class:`int`]
+        Seconds a member entry stays in Redis. ``None`` keeps members and users out of Redis
+        entirely. Defaults to six hours.
     user_ttl: :class:`int`
-        Seconds a user entry stays in Redis. Only written when ``serve_fetches`` is on.
-        Defaults to six hours.
+        Seconds a user entry stays in Redis. Defaults to six hours.
     message_ttl: Optional[:class:`int`]
-        Seconds a message stays in Redis. ``None`` disables message mirroring. Defaults to ``None``.
-    serve_fetches: :class:`bool`
-        Mirror members and users so :func:`discord.cache.get_cached_member` and
-        :func:`discord.cache.get_cached_user` can answer from Redis. Defaults to ``False``.
+        Seconds a message stays in Redis. ``None`` keeps messages out of Redis. Defaults to ``None``.
+
+    Entities kept in Redis behave as an extension of the in-memory cache: when memory has
+    already evicted a member or message that an incoming gateway event refers to, it is
+    restored from Redis before the event is handled, so the regular events fire with the
+    regular objects.
     queue_size: :class:`int`
         Bound on pending writes. Writes beyond it are dropped and logged. Defaults to ``10000``.
     batch_size: :class:`int`
@@ -154,7 +155,6 @@ class RedisSettings:
         'member_ttl',
         'user_ttl',
         'message_ttl',
-        'serve_fetches',
         'queue_size',
         'batch_size',
     )
@@ -173,10 +173,9 @@ class RedisSettings:
         thread_ttl: int = 3600,
         emoji_ttl: int = 86400,
         sticker_ttl: int = 86400,
-        member_ttl: int = 21600,
+        member_ttl: Optional[int] = 21600,
         user_ttl: int = 21600,
         message_ttl: Optional[int] = None,
-        serve_fetches: bool = False,
         queue_size: int = 10_000,
         batch_size: int = 256,
     ) -> None:
@@ -196,17 +195,16 @@ class RedisSettings:
         self.thread_ttl: int = thread_ttl
         self.emoji_ttl: int = emoji_ttl
         self.sticker_ttl: int = sticker_ttl
-        self.member_ttl: int = member_ttl
+        self.member_ttl: Optional[int] = member_ttl
         self.user_ttl: int = user_ttl
         self.message_ttl: Optional[int] = message_ttl
-        self.serve_fetches: bool = serve_fetches
         self.queue_size: int = queue_size
         self.batch_size: int = batch_size
 
     def __repr__(self) -> str:
         return (
             f'<RedisSettings uri={self.uri!r} client={self.client!r} cluster={self.cluster} message_ttl={self.message_ttl} '
-            f'serve_fetches={self.serve_fetches}>'
+            f'member_ttl={self.member_ttl}>'
         )
 
 
@@ -679,7 +677,10 @@ class RedisCache:
         self._replace_hash(pipe, _guild_key(guild_id, ':stickers'), stickers, self.settings.sticker_ttl)
 
     def set_member(self, pipe: Any, guild_id: int, user_id: int, data: Dict[str, Any]) -> None:
-        pipe.set(_member_key(guild_id, user_id), json.dumps(data), ex=self.settings.member_ttl)
+        ttl = self.settings.member_ttl
+        if ttl is None:
+            return
+        pipe.set(_member_key(guild_id, user_id), json.dumps(data), ex=ttl)
         user = data.get('user')
         if user:
             self.set_user(pipe, user_id, user)
@@ -697,6 +698,21 @@ class RedisCache:
         key = _message_key(channel_id, message_id)
         pipe.hset(key, mapping={field: json.dumps(value) for field, value in data.items()})
         pipe.expire(key, ttl)
+
+    def delete_message(self, pipe: Any, channel_id: int, message_id: int) -> None:
+        pipe.delete(_message_key(channel_id, message_id))
+
+    async def get_members(self, refs: List[Tuple[int, int]]) -> List[Optional[Dict[str, Any]]]:
+        pipe = self.pipeline()
+        for guild_id, user_id in refs:
+            pipe.get(_member_key(guild_id, user_id))
+        return [json.loads(raw) if raw is not None else None for raw in await pipe.execute()]
+
+    async def get_messages(self, channel_id: int, message_ids: List[int]) -> List[Optional[Dict[str, Any]]]:
+        pipe = self.pipeline()
+        for message_id in message_ids:
+            pipe.hgetall(_message_key(channel_id, message_id))
+        return [_load_hash(raw) if raw else None for raw in await pipe.execute()]
 
     # Reads
 
@@ -745,7 +761,7 @@ def _mirror_guild_create(cache: RedisCache, pipe: Any, data: Dict[str, Any]) -> 
     cache.replace_threads(pipe, guild_id, {int(t['id']): t for t in data.get('threads', [])})
     cache.replace_emojis(pipe, guild_id, {int(e['id']): e for e in data.get('emojis', [])})
     cache.replace_stickers(pipe, guild_id, {int(s['id']): s for s in data.get('stickers', [])})
-    if cache.settings.serve_fetches:
+    if cache.settings.member_ttl is not None:
         for member in data.get('members', []):
             cache.set_member(pipe, guild_id, int(member['user']['id']), member)
 
@@ -831,6 +847,16 @@ def _mirror_message_set(cache: RedisCache, pipe: Any, data: Dict[str, Any]) -> N
     cache.set_message(pipe, int(data['channel_id']), int(data['id']), data)
 
 
+def _mirror_message_delete(cache: RedisCache, pipe: Any, data: Dict[str, Any]) -> None:
+    cache.delete_message(pipe, int(data['channel_id']), int(data['id']))
+
+
+def _mirror_message_delete_bulk(cache: RedisCache, pipe: Any, data: Dict[str, Any]) -> None:
+    channel_id = int(data['channel_id'])
+    for message_id in data.get('ids', []):
+        cache.delete_message(pipe, channel_id, int(message_id))
+
+
 MIRROR: Dict[str, MirrorFunc] = {
     'GUILD_CREATE': _mirror_guild_create,
     'GUILD_UPDATE': _mirror_guild_update,
@@ -853,10 +879,35 @@ MIRROR: Dict[str, MirrorFunc] = {
     'GUILD_STICKERS_UPDATE': _mirror_stickers_update,
     'MESSAGE_CREATE': _mirror_message_set,
     'MESSAGE_UPDATE': _mirror_message_set,
+    'MESSAGE_DELETE': _mirror_message_delete,
+    'MESSAGE_DELETE_BULK': _mirror_message_delete_bulk,
 }
 
 _MEMBER_EVENTS = frozenset({'GUILD_MEMBER_ADD', 'GUILD_MEMBER_UPDATE', 'GUILD_MEMBER_REMOVE', 'GUILD_MEMBERS_CHUNK'})
-_MESSAGE_EVENTS = frozenset({'MESSAGE_CREATE', 'MESSAGE_UPDATE'})
+_MESSAGE_EVENTS = frozenset({'MESSAGE_CREATE', 'MESSAGE_UPDATE', 'MESSAGE_DELETE', 'MESSAGE_DELETE_BULK'})
+
+# Which cached objects a parser is about to look up, per event, so they can be restored
+# from Redis before the parser runs. First item: payload field holding the message id(s).
+# Second item: how to find the member: 'user' (data['user']['id']), 'user_id', or
+# 'user_id_if_no_member' (skip when the payload already carries the member).
+_HYDRATE: Dict[str, Tuple[Optional[str], Optional[str]]] = {
+    'MESSAGE_DELETE': ('id', None),
+    'MESSAGE_DELETE_BULK': ('ids', None),
+    'MESSAGE_UPDATE': ('id', None),
+    'MESSAGE_REACTION_ADD': ('message_id', 'user_id_if_no_member'),
+    'MESSAGE_REACTION_REMOVE': ('message_id', 'user_id'),
+    'MESSAGE_REACTION_REMOVE_ALL': ('message_id', None),
+    'MESSAGE_REACTION_REMOVE_EMOJI': ('message_id', None),
+    'MESSAGE_POLL_VOTE_ADD': ('message_id', 'user_id'),
+    'MESSAGE_POLL_VOTE_REMOVE': ('message_id', 'user_id'),
+    'PRESENCE_UPDATE': (None, 'user'),
+    'GUILD_MEMBER_UPDATE': (None, 'user'),
+    'GUILD_MEMBER_REMOVE': (None, 'user'),
+    'GUILD_BAN_ADD': (None, 'user'),
+    'TYPING_START': (None, 'user_id_if_no_member'),
+    'GUILD_SCHEDULED_EVENT_USER_ADD': (None, 'user_id'),
+    'GUILD_SCHEDULED_EVENT_USER_REMOVE': (None, 'user_id'),
+}
 
 # Events whose payload carries the guild id under ``id`` rather than ``guild_id``.
 _GUILD_ID_IN_ID = frozenset({'GUILD_CREATE', 'GUILD_UPDATE', 'GUILD_DELETE'})
@@ -918,7 +969,7 @@ class CacheManager:
         if redis is None:
             return {}
         mirror = dict(MIRROR)
-        if not redis.serve_fetches:
+        if redis.member_ttl is None:
             for event in _MEMBER_EVENTS:
                 mirror.pop(event, None)
         if redis.message_ttl is None:
@@ -1110,9 +1161,106 @@ class CacheManager:
         except Exception:
             _log.warning('Failed to prepare guild for %s', event, exc_info=True)
 
+        if self.redis is not None and event in _HYDRATE:
+            try:
+                await self._hydrate(event, data)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _log.warning('Failed to restore cache entries for %s', event, exc_info=True)
+
         mirror = self._mirror.get(event)
         if mirror is not None:
             self._enqueue(mirror, data)
+
+    async def _hydrate(self, event: str, data: Dict[str, Any]) -> None:
+        """Restores the message and member an event refers to from Redis into memory when
+        memory no longer has them, so the parser and the events it dispatches behave as if
+        nothing had been evicted."""
+        redis = self.redis
+        if redis is None or _now() < self._redis_down_until:
+            return
+        message_field, member_rule = _HYDRATE[event]
+        state = self._state
+
+        channel_id: Optional[int] = None
+        message_ids: List[int] = []
+        messages = state._messages
+        if message_field is not None and redis.settings.message_ttl is not None and messages is not None:
+            raw_channel_id = data.get('channel_id')
+            raw_ids = data.get('ids', []) if message_field == 'ids' else [data.get(message_field)]
+            if raw_channel_id is not None:
+                channel_id = int(raw_channel_id)
+                for raw_id in raw_ids:
+                    if raw_id is None:
+                        continue
+                    message_id = int(raw_id)
+                    if dict.get(messages._d, message_id) is None:
+                        message_ids.append(message_id)
+
+        member_ref: Optional[Tuple[Guild, int]] = None
+        if member_rule is not None and redis.settings.member_ttl is not None and state.member_cache_flags.joined:
+            raw_guild_id = data.get('guild_id')
+            if raw_guild_id is not None and not (member_rule == 'user_id_if_no_member' and data.get('member')):
+                raw_user_id = data['user']['id'] if member_rule == 'user' else data.get('user_id')
+                guild = state._guilds.get(int(raw_guild_id))
+                if guild is not None and raw_user_id is not None and guild.id not in self._unloaded:
+                    user_id = int(raw_user_id)
+                    if user_id not in guild._members:
+                        member_ref = (guild, user_id)
+
+        if not message_ids and member_ref is None:
+            return
+
+        try:
+            # Make sure writes queued for these keys have landed before reading them back.
+            await self.flush()
+            found_messages = await redis.get_messages(channel_id, message_ids) if message_ids else []  # type: ignore
+            found_member = (await redis.get_members([(member_ref[0].id, member_ref[1])]))[0] if member_ref else None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._mark_redis_down('read')
+            return
+
+        if member_ref is not None and found_member:
+            guild, _ = member_ref
+            guild._add_member(Member(data=found_member, guild=guild, state=state))  # type: ignore
+
+        if message_ids and messages is not None and channel_id is not None:
+            channel = state.get_channel(channel_id)
+            guild = getattr(channel, 'guild', None)
+            # Real gateway messages carry the author's member data. If a stored payload does
+            # not, restore the author member too so message.author is a Member as in memory.
+            if guild is not None and redis.settings.member_ttl is not None and state.member_cache_flags.joined:
+                missing = [
+                    int(payload['author']['id'])
+                    for payload in found_messages
+                    if payload and 'member' not in payload and int(payload['author']['id']) not in guild._members
+                ]
+                if missing:
+                    try:
+                        authors = await redis.get_members([(guild.id, user_id) for user_id in missing])
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        self._mark_redis_down('read')
+                        authors = []
+                    for author in authors:
+                        if author:
+                            guild._add_member(Member(data=author, guild=guild, state=state))  # type: ignore
+            for message_id, payload in zip(message_ids, found_messages):
+                if not payload:
+                    continue
+                target = channel
+                if target is None:
+                    raw_guild_id = payload.get('guild_id')
+                    target = PartialMessageable(
+                        state=state,
+                        id=channel_id,
+                        guild_id=int(raw_guild_id) if raw_guild_id is not None else None,
+                    )
+                messages.append(Message(state=state, channel=target, data=payload))  # type: ignore
 
     # Lifecycle
 
@@ -1328,20 +1476,19 @@ async def load_guild(guild: Guild) -> Guild:
 async def get_cached_user(client: Client, user_id: int) -> Optional[User]:
     """|coro|
 
-    Returns the user from memory, else from Redis when ``serve_fetches`` is on, else ``None``."""
+    Returns the user from memory, else from Redis when ``RedisSettings.member_ttl`` is set, else ``None``."""
     return await client._connection._cache.get_user(user_id)
 
 
 async def get_cached_member(guild: Guild, user_id: int) -> Optional[Member]:
     """|coro|
 
-    Returns the member from memory, else from Redis when ``serve_fetches`` is on, else ``None``."""
+    Returns the member from memory, else from Redis when ``RedisSettings.member_ttl`` is set, else ``None``."""
     return await guild._state._cache.get_member(guild, user_id)
 
 
 async def get_cached_message(client: Client, channel_id: int, message_id: int) -> Optional[Message]:
     """|coro|
 
-    Returns the message from memory, else from Redis when ``message_ttl`` is set, else ``None``.
-    Deleted messages stay readable from Redis until their TTL runs out."""
+    Returns the message from memory, else from Redis when ``RedisSettings.message_ttl`` is set, else ``None``."""
     return await client._connection._cache.get_message(channel_id, message_id)
