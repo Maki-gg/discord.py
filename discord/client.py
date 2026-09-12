@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     from .poll import PollAnswer
     from .subscription import Subscription
     from .flags import MemberCacheFlags
+    from .cache import CacheSettings  # Maki fork: cache layer
 
     class _ClientOptions(TypedDict, total=False):
         max_messages: Optional[int]
@@ -143,6 +144,7 @@ if TYPE_CHECKING:
         http_trace: aiohttp.TraceConfig
         max_ratelimit_timeout: Optional[float]
         connector: Optional[aiohttp.BaseConnector]
+        cache: Optional[CacheSettings]  # Maki fork: cache layer
 
 
 # fmt: off
@@ -288,6 +290,9 @@ class Client:
         behavior, such as setting a dns resolver or sslcontext.
 
         .. versionadded:: 2.5
+    cache: Optional[:class:`CacheSettings`]
+        Maki fork addition. Eviction settings for the internal cache. See :class:`CacheSettings`.
+        If not given, nothing is ever evicted, which is upstream discord.py behaviour.
 
     Attributes
     -----------
@@ -617,6 +622,7 @@ class Client:
         self.loop = loop
         self.http.loop = loop
         self._connection.loop = loop
+        await self._connection._cache.start()  # Maki fork: cache layer
 
         self._ready = asyncio.Event()
 

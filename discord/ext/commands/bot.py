@@ -82,7 +82,6 @@ if TYPE_CHECKING:
     from .hybrid import CommandCallback, ContextT, P, _HybridCommandDecoratorKwargs, _HybridGroupDecoratorKwargs
     from discord.client import _ClientOptions
     from discord.shard import _AutoShardedClientOptions
-    from discord.redis_cache import RedisCacheOptions
 
     _Prefix = Union[Iterable[str], str]
     _PrefixCallable = MaybeAwaitableFunc[[BotT, Message], _Prefix]
@@ -180,10 +179,9 @@ class BotBase(GroupMixin[None]):
         allowed_contexts: app_commands.AppCommandContext = MISSING,
         allowed_installs: app_commands.AppInstallationType = MISSING,
         intents: discord.Intents,
-        redis_cache: Optional[RedisCacheOptions] = None,
         **options: Unpack[_BotOptions],
     ) -> None:
-        super().__init__(intents=intents, **options, redis_cache=redis_cache)  # type: ignore[misc]
+        super().__init__(intents=intents, **options)
         self.command_prefix: PrefixType[BotT] = command_prefix  # type: ignore
         self.extra_events: Dict[str, List[CoroFunc]] = {}
         # Self doesn't have the ClientT bound, but since this is a mixin it technically does
@@ -219,11 +217,6 @@ class BotBase(GroupMixin[None]):
     # internal helpers
 
     async def _async_setup_hook(self) -> None:
-        # Connect Redis before setup_hook so users can use it there.
-        redis_cache = self._connection._redis_cache  # type: ignore[attr-defined]
-        if redis_cache is not None:
-            await redis_cache.connect()
-
         # self/super() resolves to Client/AutoShardedClient
         await super()._async_setup_hook()  # type: ignore
         prefix = self.command_prefix

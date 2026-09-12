@@ -5972,6 +5972,26 @@ MemberCacheFlags
 .. autoclass:: MemberCacheFlags
     :members:
 
+CacheSettings
+~~~~~~~~~~~~~~
+
+Maki fork addition, not part of upstream discord.py.
+
+.. attributetable:: CacheSettings
+
+.. autoclass:: CacheSettings
+    :members:
+
+RedisSettings
+~~~~~~~~~~~~~~
+
+Maki fork addition, not part of upstream discord.py.
+
+.. attributetable:: RedisSettings
+
+.. autoclass:: RedisSettings
+    :members:
+
 ApplicationFlags
 ~~~~~~~~~~~~~~~~~
 
