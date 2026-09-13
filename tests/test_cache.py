@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
+import pathlib
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
@@ -1046,3 +1048,69 @@ async def test_redis_member_hydration_respects_member_cache_flags() -> None:
     )
     assert guild.get_member(2) is not None
     await cache.close()
+
+
+# ---------------------------------------------------------------------------
+# Guards for upstream merges (see "Updating from upstream" in README.rst)
+# ---------------------------------------------------------------------------
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+FORK_MARKER = '# Maki fork: cache layer'
+# Upstream files that carry hook lines, with the number of marked lines each must have.
+FORK_MARKER_COUNTS = {
+    'discord/state.py': 10,
+    'discord/client.py': 3,
+    'discord/gateway.py': 1,
+    'discord/__init__.py': 1,
+}
+# Lookups inside parsers that the Redis tier must be able to satisfy after memory eviction.
+CACHE_LOOKUPS = {'_get_message', 'get_member', 'get_user', '_get_reaction_user'}
+# Parsers that look something up but must NOT be hydrated, with the reason.
+HYDRATE_EXEMPT = {
+    'GUILD_MEMBER_ADD': 'payload carries the member; hydrating first would make upstream discard the join',
+}
+
+
+def test_fork_marker_count() -> None:
+    for relative, expected in FORK_MARKER_COUNTS.items():
+        found = (REPO / relative).read_text().count(FORK_MARKER)
+        assert found == expected, f'{relative}: expected {expected} fork markers, found {found}'
+    for relative in ('discord/guild.py', 'discord/ext/commands/bot.py'):
+        assert FORK_MARKER not in (REPO / relative).read_text(), f'{relative} must stay identical to upstream'
+
+
+def _parsers_with_cache_lookups() -> Dict[str, set]:
+    tree = ast.parse((REPO / 'discord/state.py').read_text())
+    result: Dict[str, set] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or not node.name.startswith('parse_'):
+            continue
+        lookups = {
+            child.func.attr
+            for child in ast.walk(node)
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) and child.func.attr in CACHE_LOOKUPS
+        }
+        if lookups:
+            result[node.name[len('parse_') :].upper()] = lookups
+    return result
+
+
+def test_hydrate_table_covers_all_cache_lookups() -> None:
+    parsers = _parsers_with_cache_lookups()
+    assert parsers, 'no parsers with cache lookups found; the scan is broken'
+    missing = {
+        event: lookups
+        for event, lookups in parsers.items()
+        if event not in cache_mod._HYDRATE and event not in HYDRATE_EXEMPT
+    }
+    assert not missing, (
+        f'parsers that read the cache but have no _HYDRATE row (add one in discord/cache.py or exempt it here): {missing}'
+    )
+    all_parsers = {
+        node.name[len('parse_') :].upper()
+        for node in ast.walk(ast.parse((REPO / 'discord/state.py').read_text()))
+        if isinstance(node, ast.FunctionDef) and node.name.startswith('parse_')
+    }
+    stale = set(cache_mod._HYDRATE) - all_parsers
+    assert not stale, f'_HYDRATE rows without a matching parse_* method in state.py: {stale}'
+    assert set(HYDRATE_EXEMPT) <= all_parsers

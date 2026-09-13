@@ -241,6 +241,58 @@ Caveats
   are each at least as long as the matching in-memory TTL, since Redis is the fallback tier. Widen the
   Redis TTL rather than shrinking the in-memory one if this raises.
 
+Updating from upstream
+~~~~~~~~~~~~~~~~~~~~~~~
+
+The fork is designed so that syncing with ``Rapptz/discord.py`` stays easy.
+Know where the fork lives, merge, then run the checklist.
+
+**Where the fork lives**
+
+* All logic: ``discord/cache.py`` and ``tests/test_cache.py``. Upstream never touches these.
+* Hook lines inside upstream files, every one marked ``# Maki fork: cache layer``:
+  ``discord/state.py`` (10), ``discord/client.py`` (3), ``discord/gateway.py`` (1),
+  ``discord/__init__.py`` (1). 15 in total; ``tests/test_cache.py`` asserts that number.
+* ``discord/guild.py`` and ``discord/ext/commands/bot.py`` are identical to upstream and must stay so.
+* Also fork-only: this README section, the ``CacheSettings``/``RedisSettings`` entries in
+  ``docs/api.rst``, and the ``redis`` extra in ``pyproject.toml``.
+
+**Procedure**
+
+.. code:: sh
+
+    git remote add upstream https://github.com/Rapptz/discord.py.git   # once
+    git fetch upstream
+    git checkout master
+    git merge upstream/master
+
+Resolving a conflict: keep upstream's version of the surrounding code, then put the marked line(s) back.
+Never drop a marked line to make a conflict go away. If upstream rewrote a function that holds a hook,
+re-apply the hook to the new shape; each one is a single call into ``self._cache``.
+
+**Checklist after every merge**
+
+.. code:: sh
+
+    git diff upstream/master -- discord/guild.py discord/ext/commands/bot.py   # must print nothing
+    grep -rn "Maki fork: cache layer" discord/state.py discord/client.py discord/gateway.py discord/__init__.py | wc -l   # 15
+    python -m pytest -q
+    python -m pyright discord/cache.py discord/state.py discord/gateway.py discord/client.py
+    ruff format --check
+
+Two things to read rather than run, both covered by tests in ``tests/test_cache.py`` that fail loudly:
+
+* A new or changed ``parse_*`` method in ``discord/state.py`` that calls ``_get_message``, ``get_member``
+  or ``get_user`` needs a row in the ``_HYDRATE`` table in ``discord/cache.py``, otherwise that event
+  silently loses Redis hydration. ``test_hydrate_table_covers_all_cache_lookups`` scans ``state.py`` for
+  exactly this.
+* A new use of ``self._messages`` in ``state.py`` must be an operation ``MessageCache`` supports
+  (``append``, ``remove``, ``get``, ``remove_if``, iteration, ``reversed``, ``len``, truthiness). A missing
+  one surfaces as ``AttributeError`` in the test suite; add it to ``MessageCache``.
+
+When a hook is intentionally added or removed, update the count above and in ``test_fork_marker_count``
+in the same commit.
+
 Links
 ------
 
