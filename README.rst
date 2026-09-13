@@ -66,7 +66,7 @@ Optional Packages
 ~~~~~~~~~~~~~~~~~~
 
 * `PyNaCl <https://pypi.org/project/PyNaCl/>`__ (for voice support)
-* `redis <https://pypi.org/project/redis/>`__ (for Redis guild caching)
+* `redis <https://pypi.org/project/redis/>`__ (for the fork's Redis cache tier)
 
 Please note that when installing voice support on Linux, you must install the following packages via your favourite package manager (e.g. ``apt``, ``dnf``, etc) before running the above commands:
 
@@ -117,22 +117,35 @@ Bot Example
 
 You can find more examples in the examples directory.
 
-Redis Caching
---------------------
+Fork changes: caching
+---------------------
 
-Large bots accumulate significant memory over time because discord.py holds all guild data (members,
-channels, roles, threads) strongly in memory for every guild. This fork adds optional Redis-backed
-caching to offload that data and keep only the most recently active guilds fully loaded in memory.
+This fork adds a cache eviction layer that upstream discord.py does not have. All of it lives in
+``discord/cache.py``; the upstream files only carry a few hook lines marked ``# Maki fork: cache layer``.
+Without the ``cache`` option the library behaves exactly like upstream.
 
-To enable it, install the extra dependency and pass a ``RedisCacheOptions`` instance to your bot:
+What changed
+~~~~~~~~~~~~~
 
-.. code:: sh
+* ``cache=discord.CacheSettings(...)`` is accepted by ``Client``, ``AutoShardedClient``, ``commands.Bot``
+  and ``commands.AutoShardedBot``.
+* Members and threads inside a guild are evicted after ``member_ttl`` / ``thread_ttl`` seconds without
+  activity, or beyond ``member_max`` / ``thread_max`` entries per guild. The bot's own member is never evicted.
+* The message cache is keyed by id (O(1) lookups) and evicts messages after ``message_ttl`` seconds.
+  ``max_messages`` still bounds its size.
+* Optional Redis tier via ``RedisSettings``. It behaves as an extension of the in-memory cache for older
+  data: guild data, members and (optionally) messages are mirrored to Redis from a single gateway hook, and
+  when an incoming event refers to a member or message that memory already evicted, it is restored from
+  Redis before the event is handled. ``on_message_delete``, ``on_message_edit``, ``on_member_update``,
+  ``on_member_remove``, reactions and polls therefore fire exactly as they would with everything in memory.
+  With ``max_loaded_guilds`` whole guilds are unloaded from memory and restored the same way.
+* Coroutine helpers in ``discord.cache``: ``get_cached_user``, ``get_cached_member``,
+  ``get_cached_message``, ``is_guild_loaded`` and ``load_guild``.
 
-    # Linux/macOS
-    python3 -m pip install -U "discord.py[redis]"
+Setup
+~~~~~~
 
-    # Windows
-    py -3 -m pip install -U discord.py[redis]
+In-memory eviction only:
 
 .. code:: py
 
@@ -140,46 +153,145 @@ To enable it, install the extra dependency and pass a ``RedisCacheOptions`` inst
     from discord.ext import commands
 
     intents = discord.Intents.default()
-    intents.message_content = True
+    intents.members = True
 
     bot = commands.Bot(
         command_prefix='!',
         intents=intents,
-        redis_cache=discord.RedisCacheOptions(
-            uri='redis://localhost:6379',
-            max_memory_guilds=500,  # keep 500 guilds fully loaded and evict the rest to Redis
+        chunk_guilds_at_startup=False,
+        max_messages=10_000,
+        cache=discord.CacheSettings(
+            member_ttl=6 * 3600,   # members untouched for 6 hours are dropped
+            member_max=5_000,      # and at most 5000 members per guild
+            thread_ttl=3600,
+            message_ttl=3600,
         ),
     )
 
-    bot.run('token')
+With the Redis tier and guild unloading (``pip install -U "discord.py[redis]"``):
 
-``RedisCacheOptions`` accepts per-entity-type TTLs (``guild_ttl``, ``member_ttl``,
-``channel_ttl``, ``role_ttl``, ``thread_ttl``, ``emoji_ttl``, ``sticker_ttl``). Each TTL
-controls how long a guild's entire collection of that entity type lives in Redis, for example,
-a shorter ``member_ttl`` means that when a guild goes completely quiet, its member data is
-evicted from Redis sooner than its channel or role data. TTLs apply to the whole collection per
-guild, not to individual inactive members within an active guild. All values default to sensible
-values for bots running ~1000 guilds per shard.
+.. code:: py
 
-When a guild is evicted from memory its sub-entity collections (members, channels, roles, threads)
-are cleared and the guild object becomes a thin shell. The library automatically schedules a
-``guild.load()`` the moment the next gateway event for that guild arrives, so the guild
-self-heals within the same event loop tick. The first event after eviction may still observe empty
-collections, all subsequent events will see the fully restored guild.
+    bot = commands.Bot(
+        command_prefix='!',
+        intents=intents,
+        chunk_guilds_at_startup=False,
+        cache=discord.CacheSettings(
+            member_ttl=6 * 3600,
+            message_ttl=3600,
+            max_loaded_guilds=4_000,
+            redis=discord.RedisSettings(
+                ['redis://node1:6379', 'redis://node2:6379', 'redis://node3:6379'],
+                member_ttl=24 * 3600,   # members live a day in Redis after leaving memory
+                message_ttl=24 * 3600,  # same for messages (None keeps messages out of Redis)
+            ),
+        ),
+    )
 
-``guild.load()`` tries Redis first. If the Redis TTL has expired (e.g. on a long-running bot that
-hasn't reconnected in days), it falls back to the Discord REST API, fetches the guild's channels
-and roles, re-warms the Redis cache, and populates memory, all transparently. Members are not
-fetched via REST since paginating through large member lists on every cache miss would be
-prohibitive; they re-populate naturally via gateway events as users interact.
+    @bot.event
+    async def on_message_delete(message):
+        # fires even if the message left memory hours ago, as long as Redis still has it
+        ...
 
-You can also call ``await guild.load()`` proactively wherever you need guaranteed access to guild
-data. Use ``guild.is_loaded()`` to check whether a guild currently has its data in memory.
+Pass ``cluster=False`` to ``RedisSettings`` for a standalone Redis server.
 
-.. note::
+To share one connection pool between the cache and your own code (cogs, services), build the client
+yourself and hand it over with ``client=``. The library never closes a client it did not create.
+This also covers Sentinel setups:
 
-    Redis connection failures raise immediately at startup (before ``setup_hook`` runs) rather
-    than degrading silently. Ensure your Redis instance is reachable before starting the bot.
+.. code:: py
+
+    class MyBot(commands.AutoShardedBot):
+        def __init__(self, **kwargs):
+            # redis.asyncio clients can be built before the event loop runs
+            sentinel = Sentinel(SENTINEL_NODES, sentinel_kwargs={'socket_timeout': 0.5})
+            self.redis = sentinel.master_for(
+                'mymaster', connection_pool_class=BlockingSentinelConnectionPool,
+                max_connections=BUDGET, timeout=10, decode_responses=True,
+            )
+            super().__init__(
+                **kwargs,
+                cache=discord.CacheSettings(
+                    member_ttl=6 * 3600,
+                    max_loaded_guilds=4_000,
+                    redis=discord.RedisSettings(client=self.redis, message_ttl=3600),
+                ),
+            )
+
+The cache uses the shared pool sparingly: one connection for the write batcher, one per guild being
+restored, and one per ``get_cached_*`` call. Budget a few extra connections per process for it.
+
+Caveats
+~~~~~~~~
+
+* ``Guild.chunked`` compares ``member_count`` with the cached member count and is not meaningful once
+  members are evicted. Use ``chunk_guilds_at_startup=False`` with ``member_ttl``.
+* ``Client.guilds`` still lists unloaded guilds; their channels, roles and members are empty until
+  ``load_guild`` runs. Guild events trigger that automatically.
+* ``fetch_*`` methods still always hit the API. Synchronous lookups such as ``guild.get_member`` only see
+  memory; use the ``discord.cache`` helpers (``get_cached_member``, ``get_cached_user``,
+  ``get_cached_message``) for an awaitable lookup that falls back to Redis.
+* Restoring from Redis happens only for gateway events (one round trip on a memory miss). Presence and
+  typing events restore members too, so with those intents enabled expect extra Redis reads.
+* If Redis is unreachable at startup the client raises. If it fails later, mirroring pauses for 30 seconds
+  and unloaded guilds are restored from the API instead.
+* Message mirroring is high volume; only set ``RedisSettings.message_ttl`` if you need message events to
+  keep working after a message left memory.
+* ``CacheSettings`` validates that ``redis.member_ttl``, ``redis.thread_ttl`` and ``redis.message_ttl``
+  are each at least as long as the matching in-memory TTL, since Redis is the fallback tier. Widen the
+  Redis TTL rather than shrinking the in-memory one if this raises.
+
+Updating from upstream
+~~~~~~~~~~~~~~~~~~~~~~~
+
+The fork is designed so that syncing with ``Rapptz/discord.py`` stays easy.
+Know where the fork lives, merge, then run the checklist.
+
+**Where the fork lives**
+
+* All logic: ``discord/cache.py`` and ``tests/test_cache.py``. Upstream never touches these.
+* Hook lines inside upstream files, every one marked ``# Maki fork: cache layer``:
+  ``discord/state.py`` (10), ``discord/client.py`` (3), ``discord/gateway.py`` (1),
+  ``discord/__init__.py`` (1). 15 in total; ``tests/test_cache.py`` asserts that number.
+* ``discord/guild.py`` and ``discord/ext/commands/bot.py`` are identical to upstream and must stay so.
+* Also fork-only: this README section, the ``CacheSettings``/``RedisSettings`` entries in
+  ``docs/api.rst``, and the ``redis`` extra in ``pyproject.toml``.
+
+**Procedure**
+
+.. code:: sh
+
+    git remote add upstream https://github.com/Rapptz/discord.py.git   # once
+    git fetch upstream
+    git checkout master
+    git merge upstream/master
+
+Resolving a conflict: keep upstream's version of the surrounding code, then put the marked line(s) back.
+Never drop a marked line to make a conflict go away. If upstream rewrote a function that holds a hook,
+re-apply the hook to the new shape; each one is a single call into ``self._cache``.
+
+**Checklist after every merge**
+
+.. code:: sh
+
+    git diff upstream/master -- discord/guild.py discord/ext/commands/bot.py   # must print nothing
+    grep -rn "Maki fork: cache layer" discord/state.py discord/client.py discord/gateway.py discord/__init__.py | wc -l   # 15
+    python -m pytest -q
+    python -m pyright discord/cache.py discord/state.py discord/gateway.py discord/client.py
+    ruff format --check
+
+Two things to read rather than run, both covered by tests in ``tests/test_cache.py`` that fail loudly:
+
+* A new or changed ``parse_*`` method in ``discord/state.py`` that calls ``_get_message``, ``get_member``
+  or ``get_user`` needs a row in the ``_HYDRATE`` table in ``discord/cache.py``, otherwise that event
+  silently loses Redis hydration. ``test_hydrate_table_covers_all_cache_lookups`` scans ``state.py`` for
+  exactly this.
+* A new use of ``self._messages`` in ``state.py`` must be an operation ``MessageCache`` supports
+  (``append``, ``remove``, ``get``, ``remove_if``, iteration, ``reversed``, ``len``, truthiness). A missing
+  one surfaces as ``AttributeError`` in the test suite; add it to ``MessageCache``.
+
+When a hook is intentionally added or removed, update the count above and in ``test_fork_marker_count``
+in the same commit.
 
 Links
 ------

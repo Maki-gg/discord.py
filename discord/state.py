@@ -25,7 +25,7 @@ DEALINGS IN THE SOFTWARE.
 from __future__ import annotations
 
 import asyncio
-from collections import deque, OrderedDict
+from collections import OrderedDict
 import copy
 import logging
 from typing import (
@@ -42,7 +42,6 @@ from typing import (
     Sequence,
     Generic,
     Tuple,
-    Deque,
     Literal,
     overload,
 )
@@ -51,8 +50,7 @@ import inspect
 
 import os
 
-from .guild import Guild, ProxiedGuild
-from .redis_cache import RedisCache, RedisCacheOptions, GUILD_BASE_STRIP_KEYS
+from .guild import Guild
 from .activity import BaseActivity
 from .sku import Entitlement
 from .user import User, ClientUser
@@ -82,6 +80,7 @@ from .audit_logs import AuditLogEntry
 from ._types import ClientT
 from .soundboard import SoundboardSound
 from .subscription import Subscription
+from .cache import CacheManager, MessageCache  # Maki fork: cache layer
 
 
 if TYPE_CHECKING:
@@ -267,15 +266,7 @@ class ConnectionState(Generic[ClientT]):
         if self.raw_presence_flag is utils.MISSING:
             self.raw_presence_flag = not intents.members and intents.presences
 
-        redis_options: Optional[RedisCacheOptions] = options.get('redis_cache')
-        if redis_options is not None:
-            self._redis_cache: Optional[RedisCache] = RedisCache(redis_options)
-            self._max_memory_guilds: Optional[int] = redis_options.max_memory_guilds
-            self._guild_cls: Type[Guild] = ProxiedGuild
-        else:
-            self._redis_cache = None
-            self._max_memory_guilds = None
-            self._guild_cls = Guild
+        self._cache: CacheManager = CacheManager(self, options.get('cache'))  # Maki fork: cache layer
 
         self.parsers: Dict[str, Callable[[Any], None]]
         self.parsers = parsers = {}
@@ -303,8 +294,7 @@ class ConnectionState(Generic[ClientT]):
         if self._translator:
             await self._translator.unload()
 
-        if self._redis_cache is not None:
-            await self._redis_cache.close()
+        await self._cache.close()  # Maki fork: cache layer
 
         # Purposefully don't call `clear` because users rely on cache being available post-close
 
@@ -314,7 +304,7 @@ class ConnectionState(Generic[ClientT]):
         self._emojis: Dict[int, Emoji] = {}
         self._stickers: Dict[int, GuildSticker] = {}
         self._guilds: Dict[int, Guild] = {}
-        self._guild_lru: OrderedDict[int, None] = OrderedDict()
+        self._cache.reset()  # Maki fork: cache layer
         if views:
             self._view_store: ViewStore = ViewStore(self)
 
@@ -324,10 +314,7 @@ class ConnectionState(Generic[ClientT]):
         self._private_channels: OrderedDict[int, PrivateChannel] = OrderedDict()
         # extra dict to look up private channels by user id
         self._private_channels_by_user: Dict[int, DMChannel] = {}
-        if self.max_messages is not None:
-            self._messages: Optional[Deque[Message]] = deque(maxlen=self.max_messages)
-        else:
-            self._messages: Optional[Deque[Message]] = None
+        self._messages: Optional[MessageCache] = self._cache.messages()  # Maki fork: cache layer
 
     def process_chunk_requests(self, guild_id: int, nonce: Optional[str], members: List[Member], complete: bool) -> None:
         removed = []
@@ -450,25 +437,20 @@ class ConnectionState(Generic[ClientT]):
     def _get_guild(self, guild_id: Optional[int]) -> Optional[Guild]:
         # the keys of self._guilds are ints
         guild = self._guilds.get(guild_id)  # type: ignore
-        if guild is not None and self._redis_cache is not None:
-            self._touch_guild_lru(guild_id)  # type: ignore
-            if isinstance(guild, ProxiedGuild) and not guild.is_loaded():
-                asyncio.create_task(guild.load())
+        if guild is not None:  # Maki fork: cache layer
+            self._cache.touch(guild_id)
         return guild
 
     def _get_or_create_unavailable_guild(self, guild_id: int, *, data: Optional[Dict[str, Any]] = None) -> Guild:
-        return self._guilds.get(guild_id) or self._guild_cls._create_unavailable(state=self, guild_id=guild_id, data=data)
+        return self._guilds.get(guild_id) or Guild._create_unavailable(state=self, guild_id=guild_id, data=data)
 
     def _add_guild(self, guild: Guild) -> None:
         self._guilds[guild.id] = guild
-        if self._redis_cache is not None:
-            self._touch_guild_lru(guild.id)
-            if self._max_memory_guilds is not None:
-                asyncio.create_task(self._maybe_evict_guilds())
+        self._cache.guild_added(guild)  # Maki fork: cache layer
 
     def _remove_guild(self, guild: Guild) -> None:
         self._guilds.pop(guild.id, None)
-        self._guild_lru.pop(guild.id, None)
+        self._cache.forget(guild.id)  # Maki fork: cache layer
 
         for emoji in guild.emojis:
             self._emojis.pop(emoji.id, None)
@@ -477,35 +459,6 @@ class ConnectionState(Generic[ClientT]):
             self._stickers.pop(sticker.id, None)
 
         del guild
-
-    def _touch_guild_lru(self, guild_id: int) -> None:
-        """Mark a guild as recently accessed in the LRU tracker."""
-        if guild_id in self._guild_lru:
-            self._guild_lru.move_to_end(guild_id)
-        else:
-            self._guild_lru[guild_id] = None
-
-    async def _maybe_evict_guilds(self) -> None:
-        """Unload least-recently-used ProxiedGuilds when over the memory limit."""
-        if self._max_memory_guilds is None or self._redis_cache is None:
-            return
-
-        loaded_ids = [
-            gid
-            for gid, g in self._guilds.items()
-            if isinstance(g, ProxiedGuild) and g.is_loaded()
-        ]
-
-        while len(loaded_ids) > self._max_memory_guilds:
-            for lru_id in self._guild_lru:
-                guild = self._guilds.get(lru_id)
-                if isinstance(guild, ProxiedGuild) and guild.is_loaded():
-                    guild._unload()
-                    loaded_ids.remove(lru_id)
-                    _log.debug('Evicted guild %s from memory (LRU)', lru_id)
-                    break
-            else:
-                break
 
     @property
     def emojis(self) -> Sequence[Emoji]:
@@ -576,10 +529,10 @@ class ConnectionState(Generic[ClientT]):
                 self._private_channels_by_user.pop(recipient.id, None)
 
     def _get_message(self, msg_id: Optional[int]) -> Optional[Message]:
-        return utils.find(lambda m: m.id == msg_id, reversed(self._messages)) if self._messages else None
+        return self._messages.get(msg_id) if self._messages else None  # Maki fork: cache layer
 
     def _add_guild_from_data(self, data: GuildPayload) -> Guild:
-        guild = self._guild_cls(data=data, state=self)
+        guild = Guild(data=data, state=self)
         self._add_guild(guild)
         return guild
 
@@ -921,8 +874,7 @@ class ConnectionState(Generic[ClientT]):
         self.dispatch('invite_delete', invite)
 
     def parse_channel_delete(self, data: gw.ChannelDeleteEvent) -> None:
-        guild_id = utils._get_as_snowflake(data, 'guild_id')
-        guild = self._get_guild(guild_id)
+        guild = self._get_guild(utils._get_as_snowflake(data, 'guild_id'))
         channel_id = int(data['id'])
         if guild is not None:
             channel = guild.get_channel(channel_id)
@@ -941,9 +893,6 @@ class ConnectionState(Generic[ClientT]):
                 for thread in threads:
                     self.dispatch('thread_delete', thread)
                     self.dispatch('raw_thread_delete', RawThreadDeleteEvent._from_thread(thread))
-
-                if self._redis_cache is not None and guild_id is not None:
-                    asyncio.create_task(self._redis_cache.delete_channel(guild_id, channel_id))
 
     def parse_channel_update(self, data: gw.ChannelUpdateEvent) -> None:
         channel_type = try_enum(ChannelType, data.get('type'))
@@ -967,8 +916,6 @@ class ConnectionState(Generic[ClientT]):
                 old_channel = copy.copy(channel)
                 channel._update(guild, data)  # type: ignore # the data payload varies based on the channel type.
                 self.dispatch('guild_channel_update', old_channel, channel)
-                if self._redis_cache is not None and guild_id is not None:
-                    asyncio.create_task(self._redis_cache.set_channel(guild_id, channel_id, data))  # type: ignore[arg-type]
             else:
                 _log.debug('CHANNEL_UPDATE referencing an unknown channel ID: %s. Discarding.', channel_id)
         else:
@@ -987,8 +934,6 @@ class ConnectionState(Generic[ClientT]):
             channel = factory(guild=guild, state=self, data=data)  # type: ignore
             guild._add_channel(channel)  # type: ignore
             self.dispatch('guild_channel_create', channel)
-            if self._redis_cache is not None and guild_id is not None:
-                asyncio.create_task(self._redis_cache.set_channel(guild_id, int(data['id']), data))  # type: ignore[arg-type]
         else:
             _log.debug('CHANNEL_CREATE referencing an unknown guild ID: %s. Discarding.', guild_id)
             return
@@ -1024,8 +969,6 @@ class ConnectionState(Generic[ClientT]):
         thread = Thread(guild=guild, state=guild._state, data=data)
         has_thread = guild.get_thread(thread.id)
         guild._add_thread(thread)
-        if self._redis_cache is not None:
-            asyncio.create_task(self._redis_cache.set_thread(guild_id, thread.id, data))  # type: ignore[arg-type]
         if not has_thread:
             if data.get('newly_created'):
                 if thread.parent.__class__ is ForumChannel:
@@ -1050,18 +993,11 @@ class ConnectionState(Generic[ClientT]):
             thread._update(data)
             if thread.archived:
                 guild._remove_thread(thread)
-                if self._redis_cache is not None:
-                    asyncio.create_task(self._redis_cache.delete_thread(guild_id, thread.id))
-            else:
-                if self._redis_cache is not None:
-                    asyncio.create_task(self._redis_cache.set_thread(guild_id, thread.id, data))  # type: ignore[arg-type]
             self.dispatch('thread_update', old, thread)
         else:
             thread = Thread(guild=guild, state=guild._state, data=data)
             if not thread.archived:
                 guild._add_thread(thread)
-                if self._redis_cache is not None:
-                    asyncio.create_task(self._redis_cache.set_thread(guild_id, thread.id, data))  # type: ignore[arg-type]
             self.dispatch('thread_join', thread)
 
     def parse_thread_delete(self, data: gw.ThreadDeleteEvent) -> None:
@@ -1078,9 +1014,6 @@ class ConnectionState(Generic[ClientT]):
         if thread is not None:
             guild._remove_thread(thread)
             self.dispatch('thread_delete', thread)
-
-        if self._redis_cache is not None:
-            asyncio.create_task(self._redis_cache.delete_thread(guild_id, raw.thread_id))
 
     def parse_thread_list_sync(self, data: gw.ThreadListSyncEvent) -> None:
         guild_id = int(data['guild_id'])
@@ -1099,8 +1032,7 @@ class ConnectionState(Generic[ClientT]):
         else:
             previous_threads = guild._filter_threads(channel_ids)
 
-        raw_threads = data.get('threads', [])
-        threads = {d['id']: guild._store_thread(d) for d in raw_threads}
+        threads = {d['id']: guild._store_thread(d) for d in data.get('threads', [])}
 
         for member in data.get('members', []):
             try:
@@ -1118,17 +1050,6 @@ class ConnectionState(Generic[ClientT]):
 
         for thread in previous_threads.values():
             self.dispatch('thread_remove', thread)
-
-        if self._redis_cache is not None:
-            cache = self._redis_cache
-
-            async def _mirror_thread_list_sync() -> None:
-                if raw_threads:
-                    await cache.set_threads_bulk(guild_id, {int(t['id']): t for t in raw_threads})  # type: ignore[arg-type]
-                for removed_thread in previous_threads.values():
-                    await cache.delete_thread(guild_id, removed_thread.id)
-
-            asyncio.create_task(_mirror_thread_list_sync())
 
     def parse_thread_member_update(self, data: gw.ThreadMemberUpdate) -> None:
         guild_id = int(data['guild_id'])
@@ -1181,8 +1102,7 @@ class ConnectionState(Generic[ClientT]):
                 self.dispatch('thread_remove', thread)
 
     def parse_guild_member_add(self, data: gw.GuildMemberAddEvent) -> None:
-        guild_id = int(data['guild_id'])
-        guild = self._get_guild(guild_id)
+        guild = self._get_guild(int(data['guild_id']))
         if guild is None:
             _log.debug('GUILD_MEMBER_ADD referencing an unknown guild ID: %s. Discarding.', data['guild_id'])
             return
@@ -1199,9 +1119,6 @@ class ConnectionState(Generic[ClientT]):
 
         if guild._member_count is not None:
             guild._member_count += 1
-
-        if self._redis_cache is not None:
-            asyncio.create_task(self._redis_cache.set_member(guild_id, member_id, data))  # type: ignore[arg-type]
 
         self.dispatch('member_join', member)
 
@@ -1222,14 +1139,10 @@ class ConnectionState(Generic[ClientT]):
         else:
             _log.debug('GUILD_MEMBER_REMOVE referencing an unknown guild ID: %s. Discarding.', data['guild_id'])
 
-        if self._redis_cache is not None:
-            asyncio.create_task(self._redis_cache.delete_member(raw.guild_id, user.id))
-
         self.dispatch('raw_member_remove', raw)
 
     def parse_guild_member_update(self, data: gw.GuildMemberUpdateEvent) -> None:
-        guild_id = int(data['guild_id'])
-        guild = self._get_guild(guild_id)
+        guild = self._get_guild(int(data['guild_id']))
         user = data['user']
         user_id = int(user['id'])
         if guild is None:
@@ -1257,12 +1170,8 @@ class ConnectionState(Generic[ClientT]):
                 guild._add_member(member)
             _log.debug('GUILD_MEMBER_UPDATE referencing an unknown member ID: %s. Discarding.', user_id)
 
-        if self._redis_cache is not None:
-            asyncio.create_task(self._redis_cache.set_member(guild_id, user_id, data))  # type: ignore[arg-type]
-
     def parse_guild_emojis_update(self, data: gw.GuildEmojisUpdateEvent) -> None:
-        guild_id = int(data['guild_id'])
-        guild = self._get_guild(guild_id)
+        guild = self._get_guild(int(data['guild_id']))
         if guild is None:
             _log.debug('GUILD_EMOJIS_UPDATE referencing an unknown guild ID: %s. Discarding.', data['guild_id'])
             return
@@ -1272,16 +1181,10 @@ class ConnectionState(Generic[ClientT]):
             self._emojis.pop(emoji.id, None)
         # guild won't be None here
         guild.emojis = tuple(map(lambda d: self.store_emoji(guild, d), data['emojis']))
-        if self._redis_cache is not None:
-            raw_emojis = data['emojis']
-            asyncio.create_task(
-                self._redis_cache.set_emojis(guild_id, {int(e['id']): e for e in raw_emojis})  # type: ignore[arg-type]
-            )
         self.dispatch('guild_emojis_update', guild, before_emojis, guild.emojis)
 
     def parse_guild_stickers_update(self, data: gw.GuildStickersUpdateEvent) -> None:
-        guild_id = int(data['guild_id'])
-        guild = self._get_guild(guild_id)
+        guild = self._get_guild(int(data['guild_id']))
         if guild is None:
             _log.debug('GUILD_STICKERS_UPDATE referencing an unknown guild ID: %s. Discarding.', data['guild_id'])
             return
@@ -1291,11 +1194,6 @@ class ConnectionState(Generic[ClientT]):
             self._stickers.pop(emoji.id, None)
 
         guild.stickers = tuple(map(lambda d: self.store_sticker(guild, d), data['stickers']))
-        if self._redis_cache is not None:
-            raw_stickers = data['stickers']
-            asyncio.create_task(
-                self._redis_cache.set_stickers(guild_id, {int(s['id']): s for s in raw_stickers})  # type: ignore[arg-type]
-            )
         self.dispatch('guild_stickers_update', guild, before_stickers, guild.stickers)
 
     def parse_guild_audit_log_entry_create(self, data: gw.GuildAuditLogEntryCreate) -> None:
@@ -1420,43 +1318,6 @@ class ConnectionState(Generic[ClientT]):
         else:
             return True
 
-    # ------------------------------------------------------------------
-    # Redis mirror helpers
-    # ------------------------------------------------------------------
-
-    async def _mirror_guild_create(self, data: Dict[str, Any]) -> None:
-        """Write all guild sub-entities to Redis after a GUILD_CREATE event."""
-        cache = self._redis_cache
-        if cache is None:
-            return
-        guild_id = int(data['id'])
-
-        base = {k: v for k, v in data.items() if k not in GUILD_BASE_STRIP_KEYS}
-        await cache.set_guild_base(guild_id, base)
-
-        roles = data.get('roles', [])
-        if roles:
-            await cache.set_roles_bulk(guild_id, {int(r['id']): r for r in roles})
-
-        channels = data.get('channels', [])
-        if channels:
-            await cache.set_channels_bulk(guild_id, {int(c['id']): c for c in channels})
-
-        members = data.get('members', [])
-        if members:
-            await cache.set_members_bulk(guild_id, {int(m['user']['id']): m for m in members})
-
-        threads = data.get('threads', [])
-        if threads:
-            await cache.set_threads_bulk(guild_id, {int(t['id']): t for t in threads})
-
-        if self.cache_guild_expressions:
-            emojis = data.get('emojis', [])
-            await cache.set_emojis(guild_id, {int(e['id']): e for e in emojis})
-
-            stickers = data.get('stickers', [])
-            await cache.set_stickers(guild_id, {int(s['id']): s for s in stickers})
-
     def parse_guild_create(self, data: gw.GuildCreateEvent) -> None:
         unavailable = data.get('unavailable')
         if unavailable is True:
@@ -1464,9 +1325,6 @@ class ConnectionState(Generic[ClientT]):
             return
 
         guild = self._get_create_guild(data)
-
-        if self._redis_cache is not None:
-            asyncio.create_task(self._mirror_guild_create(data))  # type: ignore[arg-type]
 
         if self._add_ready_state(guild):
             return  # We're waiting for the ready event, put the rest on hold
@@ -1488,25 +1346,11 @@ class ConnectionState(Generic[ClientT]):
             old_guild = copy.copy(guild)
             guild._from_data(data)
             self.dispatch('guild_update', old_guild, guild)
-
-            if self._redis_cache is not None:
-                cache = self._redis_cache
-                guild_id = int(data['id'])
-                base = {k: v for k, v in data.items() if k not in GUILD_BASE_STRIP_KEYS}
-
-                async def _mirror() -> None:
-                    await cache.set_guild_base(guild_id, base)
-                    roles: List[Any] = data.get('roles', [])  # type: ignore[assignment]
-                    if roles:
-                        await cache.set_roles_bulk(guild_id, {int(r['id']): r for r in roles})
-
-                asyncio.create_task(_mirror())
         else:
             _log.debug('GUILD_UPDATE referencing an unknown guild ID: %s. Discarding.', data['id'])
 
     def parse_guild_delete(self, data: gw.GuildDeleteEvent) -> None:
-        guild_id = int(data['id'])
-        guild = self._get_guild(guild_id)
+        guild = self._get_guild(int(data['id']))
         if guild is None:
             _log.debug('GUILD_DELETE referencing an unknown guild ID: %s. Discarding.', data['id'])
             return
@@ -1520,12 +1364,7 @@ class ConnectionState(Generic[ClientT]):
 
         # do a cleanup of the messages cache
         if self._messages is not None:
-            self._messages: Optional[Deque[Message]] = deque(
-                (msg for msg in self._messages if msg.guild != guild), maxlen=self.max_messages
-            )
-
-        if self._redis_cache is not None:
-            asyncio.create_task(self._redis_cache.delete_guild(guild_id))
+            self._messages.remove_if(lambda msg: msg.guild == guild)  # Maki fork: cache layer
 
         self._remove_guild(guild)
         self.dispatch('guild_remove', guild)
@@ -1553,8 +1392,7 @@ class ConnectionState(Generic[ClientT]):
             self.dispatch('member_unban', guild, user)
 
     def parse_guild_role_create(self, data: gw.GuildRoleCreateEvent) -> None:
-        guild_id = int(data['guild_id'])
-        guild = self._get_guild(guild_id)
+        guild = self._get_guild(int(data['guild_id']))
         if guild is None:
             _log.debug('GUILD_ROLE_CREATE referencing an unknown guild ID: %s. Discarding.', data['guild_id'])
             return
@@ -1562,13 +1400,10 @@ class ConnectionState(Generic[ClientT]):
         role_data = data['role']
         role = Role(guild=guild, data=role_data, state=self)
         guild._add_role(role)
-        if self._redis_cache is not None:
-            asyncio.create_task(self._redis_cache.set_role(guild_id, role.id, role_data))  # type: ignore[arg-type]
         self.dispatch('guild_role_create', role)
 
     def parse_guild_role_delete(self, data: gw.GuildRoleDeleteEvent) -> None:
-        guild_id = int(data['guild_id'])
-        guild = self._get_guild(guild_id)
+        guild = self._get_guild(int(data['guild_id']))
         if guild is not None:
             role_id = int(data['role_id'])
             try:
@@ -1576,15 +1411,12 @@ class ConnectionState(Generic[ClientT]):
             except KeyError:
                 return
             else:
-                if self._redis_cache is not None:
-                    asyncio.create_task(self._redis_cache.delete_role(guild_id, role_id))
                 self.dispatch('guild_role_delete', role)
         else:
             _log.debug('GUILD_ROLE_DELETE referencing an unknown guild ID: %s. Discarding.', data['guild_id'])
 
     def parse_guild_role_update(self, data: gw.GuildRoleUpdateEvent) -> None:
-        guild_id = int(data['guild_id'])
-        guild = self._get_guild(guild_id)
+        guild = self._get_guild(int(data['guild_id']))
         if guild is not None:
             role_data = data['role']
             role_id = int(role_data['id'])
@@ -1592,8 +1424,6 @@ class ConnectionState(Generic[ClientT]):
             if role is not None:
                 old_role = copy.copy(role)
                 role._update(role_data)
-                if self._redis_cache is not None:
-                    asyncio.create_task(self._redis_cache.set_role(guild_id, role_id, role_data))  # type: ignore[arg-type]
                 self.dispatch('guild_role_update', old_role, role)
         else:
             _log.debug('GUILD_ROLE_UPDATE referencing an unknown guild ID: %s. Discarding.', data['guild_id'])
@@ -1606,8 +1436,7 @@ class ConnectionState(Generic[ClientT]):
         if guild is None:
             return
 
-        raw_members = data.get('members', [])
-        members = [Member(guild=guild, data=member, state=self) for member in raw_members]
+        members = [Member(guild=guild, data=member, state=self) for member in data.get('members', [])]
         _log.debug('Processed a chunk for %s members in guild ID %s.', len(members), guild_id)
 
         if presences:
@@ -1620,13 +1449,6 @@ class ConnectionState(Generic[ClientT]):
                 if member is not None:
                     raw_presence = RawPresenceUpdateEvent(data=presence, state=self)
                     member._presence_update(raw_presence, user)
-
-        if self._redis_cache is not None and raw_members:
-            asyncio.create_task(
-                self._redis_cache.set_members_bulk(
-                    guild_id, {int(m['user']['id']): m for m in raw_members}  # type: ignore[arg-type]
-                )
-            )
 
         complete = data.get('chunk_index', 0) + 1 == data.get('chunk_count')
         self.process_chunk_requests(guild_id, data.get('nonce'), members, complete)

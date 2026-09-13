@@ -41,7 +41,7 @@ voice = [
     "davey>=0.1.0"
 ]
 redis = [
-    "redis>=4.2.0"
+    "redis>=5.0.1"
 ]
 docs = [
     "sphinx==4.4.0",

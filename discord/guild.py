@@ -24,7 +24,6 @@ DEALINGS IN THE SOFTWARE.
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import datetime
 from typing import (
@@ -98,13 +97,11 @@ from .automod import AutoModRule, AutoModTrigger, AutoModRuleAction
 from .partial_emoji import _EmojiTag, PartialEmoji
 from .soundboard import SoundboardSound
 from .presences import RawPresenceUpdateEvent
-from .redis_cache import GUILD_BASE_STRIP_KEYS
 
 __all__ = (
     'Guild',
     'GuildPreview',
     'BanEntry',
-    'ProxiedGuild',
 )
 
 MISSING = utils.MISSING
@@ -4962,146 +4959,3 @@ class Guild(Hashable):
             reason=reason if reason is not MISSING else None,
         )
         return Onboarding(data=data, guild=self, state=self._state)
-
-
-class ProxiedGuild(Guild):
-    """A :class:`Guild` subclass used when Redis caching is enabled.
-
-    Guild sub-entity dicts (members, channels, roles, threads, emojis,
-    stickers) can be evicted from memory via :meth:`_unload` and
-    restored on demand via :meth:`load`.  The guild's scalar metadata
-    (name, id, owner, etc.) always remains in memory.
-    """
-
-    __slots__ = ('_is_loaded',)
-
-    def __init__(self, *, data: GuildPayload, state: ConnectionState) -> None:  # type: ignore[override]
-        self._is_loaded: bool = False
-        super().__init__(data=data, state=state)
-        # Mark as fully loaded only for real (available) guilds with sub-entity data.
-        # Unavailable stubs and base-only payloads remain _is_loaded=False.
-        self._is_loaded = not self.unavailable and (
-            'channels' in data or 'members' in data or 'roles' in data
-        )
-
-    def is_loaded(self) -> bool:
-        """:class:`bool`: Whether sub-entity dicts are currently in memory."""
-        return self._is_loaded
-
-    def _unload(self) -> None:
-        """Clear all heavy sub-entity dicts, freeing memory.
-
-        Redis already has the current state from continuous event mirroring,
-        so nothing needs to be written here.
-        """
-        self._channels = {}
-        self._members = {}
-        self._roles = {}
-        self._threads = {}
-        self._stage_instances = {}
-        self._scheduled_events = {}
-        self._soundboard_sounds = {}
-        self._voice_states = {}
-        for emoji in self.emojis:
-            self._state._emojis.pop(emoji.id, None)
-        for sticker in self.stickers:
-            self._state._stickers.pop(sticker.id, None)
-        self.emojis = ()
-        self.stickers = ()
-        self._is_loaded = False
-
-    async def load(self) -> 'ProxiedGuild':
-        """|coro|
-
-        Populate sub-entity dicts for this guild.  If the guild is already
-        loaded this is a no-op.
-
-        Tries Redis first.  If the Redis TTL has expired, falls back to the
-        Discord REST API and re-warms the cache so subsequent loads are fast.
-        Members are not fetched via REST — they re-populate through gateway
-        events as users interact with the bot.
-        """
-        if self._is_loaded:
-            return self
-
-        cache = self._state._redis_cache
-        if cache is None:
-            raise RuntimeError('Redis cache is not configured on this ConnectionState.')
-
-        base_data = await cache.get_guild_base(self.id)
-
-        self._channels = {}
-        self._members = {}
-        self._threads = {}
-        self._stage_instances = {}
-        self._scheduled_events = {}
-        self._soundboard_sounds = {}
-        self._voice_states = {}
-
-        if base_data is not None:
-            # Fast path: data is in Redis.
-            self._from_data(base_data)
-
-            roles_raw = await cache.get_roles(self.id)
-            for role_data in roles_raw.values():
-                role = Role(guild=self, data=role_data, state=self._state)
-                self._roles[role.id] = role
-
-            channels_raw = await cache.get_channels(self.id)
-            for ch_data in channels_raw.values():
-                factory, _ = _guild_channel_factory(ch_data['type'])
-                if factory:
-                    channel = factory(guild=self, data=ch_data, state=self._state)  # type: ignore[arg-type]
-                    self._channels[channel.id] = channel  # type: ignore[index]
-
-            members_raw = await cache.get_members(self.id)
-            for member_data in members_raw.values():
-                member = Member(data=member_data, guild=self, state=self._state)  # type: ignore[arg-type]
-                self._members[member.id] = member
-
-            threads_raw = await cache.get_threads(self.id)
-            for thread_data in threads_raw.values():
-                thread = Thread(guild=self, state=self._state, data=thread_data)
-                self._threads[thread.id] = thread
-
-            if self._state.cache_guild_expressions:
-                emojis_raw = await cache.get_emojis(self.id)
-                if emojis_raw:
-                    self.emojis = tuple(self._state.store_emoji(self, d) for d in emojis_raw.values())
-                stickers_raw = await cache.get_stickers(self.id)
-                if stickers_raw:
-                    self.stickers = tuple(self._state.store_sticker(self, d) for d in stickers_raw.values())
-        else:
-            # Slow path: Redis TTL expired.  Fetch from REST and re-warm the cache.
-            # Members are intentionally omitted — paginated REST fetch is prohibitive
-            # for large guilds; they re-populate via gateway events as users interact.
-            guild_data, channels_data = await asyncio.gather(
-                self._state.http.get_guild(self.id, with_counts=False),
-                self._state.http.get_all_guild_channels(self.id),
-            )
-            channels_list: list = channels_data or []
-            raw_roles: list = guild_data.get('roles', [])
-            raw_emojis: list = guild_data.get('emojis', [])
-            raw_stickers: list = guild_data.get('stickers', [])
-
-            # Re-warm Redis in parallel.
-            base = {k: v for k, v in guild_data.items() if k not in GUILD_BASE_STRIP_KEYS}
-            rewarm = [cache.set_guild_base(self.id, base)]
-            if raw_roles:
-                rewarm.append(cache.set_roles_bulk(self.id, {int(r['id']): r for r in raw_roles}))
-            if channels_list:
-                rewarm.append(cache.set_channels_bulk(self.id, {int(c['id']): c for c in channels_list}))
-            if self._state.cache_guild_expressions:
-                if raw_emojis:
-                    rewarm.append(cache.set_emojis(self.id, {int(e['id']): e for e in raw_emojis}))
-                if raw_stickers:
-                    rewarm.append(cache.set_stickers(self.id, {int(s['id']): s for s in raw_stickers}))
-            await asyncio.gather(*rewarm)
-
-            # Populate in-memory structures from the REST payload.
-            guild_data['channels'] = channels_list
-            self._from_data(guild_data)
-
-        self._is_loaded = True
-        self._state._touch_guild_lru(self.id)
-        return self
