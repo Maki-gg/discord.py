@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
-import json
 import logging
 import time
 from collections import OrderedDict
@@ -52,6 +51,7 @@ from typing import (
     Union,
 )
 
+from . import utils
 from .channel import PartialMessageable, _guild_channel_factory
 from .member import Member
 from .message import Message
@@ -538,7 +538,7 @@ def _message_key(channel_id: int, message_id: int) -> str:
 
 
 def _load_hash(raw: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
-    return {key: json.loads(value) for key, value in raw.items()}
+    return {key: utils._from_json(value) for key, value in raw.items()}
 
 
 class RedisCache:
@@ -621,7 +621,7 @@ class RedisCache:
     def _hset_bulk(self, pipe: Any, key: str, mapping: Dict[int, Dict[str, Any]], ttl: int) -> None:
         if not mapping:
             return
-        pipe.hset(key, mapping={str(k): json.dumps(v) for k, v in mapping.items()})
+        pipe.hset(key, mapping={str(k): utils._to_json(v) for k, v in mapping.items()})
         pipe.expire(key, ttl)
 
     def _replace_hash(self, pipe: Any, key: str, mapping: Dict[int, Dict[str, Any]], ttl: int) -> None:
@@ -629,11 +629,11 @@ class RedisCache:
         self._hset_bulk(pipe, key, mapping, ttl)
 
     def _hset_one(self, pipe: Any, key: str, field: int, data: Dict[str, Any], ttl: int) -> None:
-        pipe.hset(key, str(field), json.dumps(data))
+        pipe.hset(key, str(field), utils._to_json(data))
         pipe.expire(key, ttl)
 
     def set_guild_base(self, pipe: Any, guild_id: int, data: Dict[str, Any]) -> None:
-        pipe.set(_guild_key(guild_id), json.dumps(data), ex=self.settings.guild_ttl)
+        pipe.set(_guild_key(guild_id), utils._to_json(data), ex=self.settings.guild_ttl)
 
     def delete_guild(self, pipe: Any, guild_id: int) -> None:
         pipe.delete(_guild_key(guild_id))
@@ -680,7 +680,7 @@ class RedisCache:
         ttl = self.settings.member_ttl
         if ttl is None:
             return
-        pipe.set(_member_key(guild_id, user_id), json.dumps(data), ex=ttl)
+        pipe.set(_member_key(guild_id, user_id), utils._to_json(data), ex=ttl)
         user = data.get('user')
         if user:
             self.set_user(pipe, user_id, user)
@@ -689,14 +689,14 @@ class RedisCache:
         pipe.delete(_member_key(guild_id, user_id))
 
     def set_user(self, pipe: Any, user_id: int, data: Dict[str, Any]) -> None:
-        pipe.set(_user_key(user_id), json.dumps(data), ex=self.settings.user_ttl)
+        pipe.set(_user_key(user_id), utils._to_json(data), ex=self.settings.user_ttl)
 
     def set_message(self, pipe: Any, channel_id: int, message_id: int, data: Dict[str, Any]) -> None:
         ttl = self.settings.message_ttl
         if ttl is None or not data:
             return
         key = _message_key(channel_id, message_id)
-        pipe.hset(key, mapping={field: json.dumps(value) for field, value in data.items()})
+        pipe.hset(key, mapping={field: utils._to_json(value) for field, value in data.items()})
         pipe.expire(key, ttl)
 
     def delete_message(self, pipe: Any, channel_id: int, message_id: int) -> None:
@@ -706,7 +706,7 @@ class RedisCache:
         pipe = self.pipeline()
         for guild_id, user_id in refs:
             pipe.get(_member_key(guild_id, user_id))
-        return [json.loads(raw) if raw is not None else None for raw in await pipe.execute()]
+        return [utils._from_json(raw) if raw is not None else None for raw in await pipe.execute()]
 
     async def get_messages(self, channel_id: int, message_ids: List[int]) -> List[Optional[Dict[str, Any]]]:
         pipe = self.pipeline()
@@ -718,7 +718,7 @@ class RedisCache:
 
     async def get_guild_base(self, guild_id: int) -> Optional[Dict[str, Any]]:
         raw = await self.client.get(_guild_key(guild_id))
-        return json.loads(raw) if raw is not None else None
+        return utils._from_json(raw) if raw is not None else None
 
     async def get_guild_bundle(self, guild_id: int) -> Optional[Tuple[Dict[str, Any], ...]]:
         """Returns ``(base, roles, channels, threads, emojis, stickers)`` in one round trip,
@@ -731,15 +731,15 @@ class RedisCache:
         base = results[0]
         if base is None:
             return None
-        return (json.loads(base), *[_load_hash(raw) for raw in results[1:]])
+        return (utils._from_json(base), *[_load_hash(raw) for raw in results[1:]])
 
     async def get_member(self, guild_id: int, user_id: int) -> Optional[Dict[str, Any]]:
         raw = await self.client.get(_member_key(guild_id, user_id))
-        return json.loads(raw) if raw is not None else None
+        return utils._from_json(raw) if raw is not None else None
 
     async def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
         raw = await self.client.get(_user_key(user_id))
-        return json.loads(raw) if raw is not None else None
+        return utils._from_json(raw) if raw is not None else None
 
     async def get_message(self, channel_id: int, message_id: int) -> Optional[Dict[str, Any]]:
         raw = await self.client.hgetall(_message_key(channel_id, message_id))
