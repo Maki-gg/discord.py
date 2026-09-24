@@ -304,7 +304,6 @@ class ConnectionState(Generic[ClientT]):
         self._emojis: Dict[int, Emoji] = {}
         self._stickers: Dict[int, GuildSticker] = {}
         self._guilds: Dict[int, Guild] = {}
-        self._cache.reset()  # Maki fork: cache layer
         if views:
             self._view_store: ViewStore = ViewStore(self)
 
@@ -436,10 +435,7 @@ class ConnectionState(Generic[ClientT]):
 
     def _get_guild(self, guild_id: Optional[int]) -> Optional[Guild]:
         # the keys of self._guilds are ints
-        guild = self._guilds.get(guild_id)  # type: ignore
-        if guild is not None:  # Maki fork: cache layer
-            self._cache.touch(guild_id)
-        return guild
+        return self._guilds.get(guild_id)  # type: ignore
 
     def _get_or_create_unavailable_guild(self, guild_id: int, *, data: Optional[Dict[str, Any]] = None) -> Guild:
         return self._guilds.get(guild_id) or Guild._create_unavailable(state=self, guild_id=guild_id, data=data)
@@ -450,7 +446,6 @@ class ConnectionState(Generic[ClientT]):
 
     def _remove_guild(self, guild: Guild) -> None:
         self._guilds.pop(guild.id, None)
-        self._cache.forget(guild.id)  # Maki fork: cache layer
 
         for emoji in guild.emojis:
             self._emojis.pop(emoji.id, None)

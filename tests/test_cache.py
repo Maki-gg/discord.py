@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import ast
-import asyncio
-import json
 import pathlib
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -13,16 +11,7 @@ import pytest
 
 import discord
 from discord import cache as cache_mod
-from discord.cache import (
-    MIRROR,
-    CacheManager,
-    CacheSettings,
-    MessageCache,
-    RedisCache,
-    RedisSettings,
-    TTLDict,
-    _mirror_guild_create,
-)
+from discord.cache import CacheManager, CacheSettings, MessageCache, TTLDict
 from discord.utils import SequenceProxy
 
 
@@ -47,95 +36,6 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
     clock = Clock()
     monkeypatch.setattr(cache_mod, '_now', clock)
     return clock
-
-
-class FakePipeline:
-    def __init__(self, store: 'FakeRedis') -> None:
-        self.store = store
-        self.ops: List[tuple] = []
-
-    def __getattr__(self, name: str):
-        def record(*args: Any, **kwargs: Any) -> None:
-            self.ops.append((name, args, kwargs))
-
-        return record
-
-    async def execute(self) -> List[Any]:
-        ops, self.ops = self.ops, []
-        return [self.store.apply(op) for op in ops]
-
-
-class FakeRedis:
-    """Just enough of redis.asyncio to exercise the cache: strings, hashes, TTLs."""
-
-    def __init__(self) -> None:
-        self.data: Dict[str, Any] = {}
-        self.ttls: Dict[str, int] = {}
-        self.fail = False
-        self.closed = False
-        self.executed = 0
-
-    def pipeline(self, transaction: bool = False) -> FakePipeline:
-        return FakePipeline(self)
-
-    async def ping(self) -> bool:
-        return True
-
-    async def aclose(self) -> None:
-        self.closed = True
-
-    async def get(self, key: str) -> Any:
-        return self.apply(('get', (key,), {}))
-
-    async def hgetall(self, key: str) -> Dict[str, str]:
-        return self.apply(('hgetall', (key,), {}))
-
-    def apply(self, op: tuple) -> Any:
-        if self.fail:
-            raise ConnectionError('redis down')
-        name, args, kwargs = op
-        self.executed += 1
-        if name == 'set':
-            key, value = args
-            self.data[key] = value
-            if kwargs.get('ex') is not None:
-                self.ttls[key] = kwargs['ex']
-            return True
-        if name == 'get':
-            value = self.data.get(args[0])
-            return value if isinstance(value, str) else None
-        if name == 'hset':
-            key = args[0]
-            bucket = self.data.setdefault(key, {})
-            if kwargs.get('mapping'):
-                bucket.update(kwargs['mapping'])
-                return len(kwargs['mapping'])
-            bucket[args[1]] = args[2]
-            return 1
-        if name == 'hgetall':
-            value = self.data.get(args[0])
-            return dict(value) if isinstance(value, dict) else {}
-        if name == 'hdel':
-            bucket = self.data.get(args[0], {})
-            return sum(1 for field in args[1:] if bucket.pop(field, None) is not None)
-        if name == 'delete':
-            return sum(1 for key in args if self.data.pop(key, None) is not None)
-        if name == 'expire':
-            self.ttls[args[0]] = args[1]
-            return True
-        raise AssertionError(f'unexpected op {name}')
-
-    def string(self, key: str) -> Any:
-        return json.loads(self.data[key])
-
-    def hash(self, key: str) -> Dict[str, Any]:
-        return {k: json.loads(v) for k, v in self.data[key].items()}
-
-
-def redis_cache(**kwargs: Any) -> RedisCache:
-    rc = RedisCache(RedisSettings('redis://test', cluster=False, **kwargs))
-    rc._client = FakeRedis()
-    return rc
 
 
 def fake_message(message_id: int, guild: Any = None) -> SimpleNamespace:
@@ -181,15 +81,6 @@ def manager(settings: CacheSettings = None, **state_kwargs: Any) -> CacheManager
     m = CacheManager(state, settings)  # type: ignore
     state._messages = m.messages()
     return m
-
-
-async def connect_fake(manager: CacheManager) -> FakeRedis:
-    fake = FakeRedis()
-    assert manager.redis is not None
-    manager.redis._client = fake
-    manager.redis._owns_client = True
-    await manager.start()
-    return fake
 
 
 GUILD_CREATE = {
@@ -425,214 +316,17 @@ def test_message_cache_ttl_and_remove_if(clock: Clock) -> None:
 
 
 def test_settings_validation() -> None:
-    with pytest.raises(TypeError):
-        CacheSettings(max_loaded_guilds=10)
     with pytest.raises(ValueError):
         CacheSettings(member_ttl=0)
     with pytest.raises(ValueError):
-        CacheSettings(sweep_interval=0)
+        CacheSettings(member_max=-1)
     with pytest.raises(ValueError):
-        RedisSettings([])
-    s = RedisSettings(['redis://a', 'redis://b'])
-    assert s.uri == ['redis://a', 'redis://b'] and s.cluster is True
-    assert RedisSettings('redis://a').uri == ['redis://a']
+        CacheSettings(sweep_interval=0)
+    with pytest.raises(TypeError):
+        CacheSettings(redis=None)  # type: ignore  # removed option must not be silently accepted
+    with pytest.raises(TypeError):
+        CacheSettings(thread_ttl=10)  # type: ignore
     assert 'member_ttl' in repr(CacheSettings(member_ttl=5))
-
-
-def test_settings_rejects_redis_ttl_shorter_than_memory_ttl() -> None:
-    # member_ttl: Redis defaults to 6h, which is too short for a 1 day in-memory TTL.
-    with pytest.raises(ValueError, match='member_ttl'):
-        CacheSettings(member_ttl=86400, redis=RedisSettings('redis://x', cluster=False))
-    # thread_ttl: Redis defaults to 1h.
-    with pytest.raises(ValueError, match='thread_ttl'):
-        CacheSettings(thread_ttl=7200, redis=RedisSettings('redis://x', cluster=False))
-    # message_ttl: only checked when Redis actually mirrors messages.
-    CacheSettings(message_ttl=7200, redis=RedisSettings('redis://x', cluster=False))  # redis message_ttl is None: fine
-    with pytest.raises(ValueError, match='message_ttl'):
-        CacheSettings(message_ttl=7200, redis=RedisSettings('redis://x', cluster=False, message_ttl=3600))
-    # equal TTLs and an explicitly longer Redis TTL are both fine.
-    CacheSettings(member_ttl=21600, redis=RedisSettings('redis://x', cluster=False))
-    CacheSettings(member_ttl=3600, redis=RedisSettings('redis://x', cluster=False, member_ttl=21600))
-
-
-# ---------------------------------------------------------------------------
-# Redis mirror table
-# ---------------------------------------------------------------------------
-
-
-async def run_mirror(rc: RedisCache, event: str, data: Dict[str, Any]) -> FakeRedis:
-    pipe = rc.pipeline()
-    MIRROR[event](rc, pipe, data)
-    await pipe.execute()
-    return rc.client
-
-
-@pytest.mark.asyncio
-async def test_mirror_guild_create_and_hash_tags() -> None:
-    rc = redis_cache(thread_ttl=77)
-    payload = dict(
-        GUILD_CREATE,
-        threads=[
-            {'id': '30', 'guild_id': '1', 'type': 11, 'name': 't', 'parent_id': '20', 'thread_metadata': {'archived': False}}
-        ],
-    )
-    fake = await run_mirror(rc, 'GUILD_CREATE', payload)
-    assert fake.string('guild:{1}')['name'] == 'guild' and 'members' not in fake.string('guild:{1}')
-    assert set(fake.hash('guild:{1}:roles')) == {'1'} and set(fake.hash('guild:{1}:channels')) == {'20'}
-    assert set(fake.hash('guild:{1}:threads')) == {'30'} and fake.ttls['guild:{1}:threads'] == 77
-    assert fake.string('member:{1}:2')['user']['id'] == '2' and fake.string('user:2')['username'] == 'user'
-    for key in fake.data:
-        if key.startswith(('guild:', 'member:')):
-            assert '{1}' in key, key
-    assert fake.ttls['guild:{1}'] == rc.settings.guild_ttl
-
-    bundle = await rc.get_guild_bundle(1)
-    assert bundle is not None
-    base, roles, channels, threads, emojis, stickers = bundle
-    assert base['id'] == '1' and '1' in roles and '20' in channels and '30' in threads and emojis == {} and stickers == {}
-    assert await rc.get_member(1, 2) is not None and await rc.get_user(2) is not None
-
-    await run_mirror(rc, 'GUILD_DELETE', {'id': '1'})
-    assert await rc.get_guild_bundle(1) is None and not any(k.startswith('guild:') for k in fake.data)
-
-
-@pytest.mark.asyncio
-async def test_mirror_guild_create_skips_unavailable_and_members_without_member_ttl() -> None:
-    rc = redis_cache(member_ttl=None)
-    fake = await run_mirror(rc, 'GUILD_CREATE', {'id': '5', 'unavailable': True})
-    assert fake.data == {}
-    fake = await run_mirror(rc, 'GUILD_CREATE', GUILD_CREATE)
-    assert not any(k.startswith(('member:', 'user:')) for k in fake.data)
-
-
-@pytest.mark.asyncio
-async def test_mirror_sub_entities() -> None:
-    rc = redis_cache()
-    fake = await run_mirror(rc, 'GUILD_CREATE', GUILD_CREATE)
-    await run_mirror(rc, 'CHANNEL_CREATE', {'id': '21', 'guild_id': '1', 'type': 0, 'name': 'new'})
-    await run_mirror(rc, 'CHANNEL_DELETE', {'id': '20', 'guild_id': '1', 'type': 0})
-    assert set(fake.hash('guild:{1}:channels')) == {'21'}
-    await run_mirror(rc, 'CHANNEL_CREATE', {'id': '99', 'type': 1})  # DM: ignored
-    assert 'guild:{None}:channels' not in fake.data
-
-    await run_mirror(rc, 'GUILD_ROLE_CREATE', {'guild_id': '1', 'role': {'id': '7', 'name': 'r'}})
-    await run_mirror(rc, 'GUILD_ROLE_DELETE', {'guild_id': '1', 'role_id': '1'})
-    assert set(fake.hash('guild:{1}:roles')) == {'7'}
-    await run_mirror(rc, 'GUILD_UPDATE', {'id': '1', 'name': 'renamed', 'roles': [{'id': '8', 'name': 'x'}]})
-    assert fake.string('guild:{1}')['name'] == 'renamed' and set(fake.hash('guild:{1}:roles')) == {'8'}
-
-    thread = {'id': '30', 'guild_id': '1', 'thread_metadata': {'archived': False}}
-    await run_mirror(rc, 'THREAD_CREATE', thread)
-    assert '30' in fake.hash('guild:{1}:threads')
-    await run_mirror(rc, 'THREAD_UPDATE', dict(thread, thread_metadata={'archived': True}))
-    assert '30' not in fake.hash('guild:{1}:threads')
-    await run_mirror(rc, 'THREAD_LIST_SYNC', {'guild_id': '1', 'threads': [dict(thread, id='31')]})
-    assert set(fake.hash('guild:{1}:threads')) == {'31'}
-    await run_mirror(rc, 'THREAD_LIST_SYNC', {'guild_id': '1', 'channel_ids': ['20'], 'threads': [dict(thread, id='32')]})
-    assert set(fake.hash('guild:{1}:threads')) == {'31', '32'}
-    await run_mirror(rc, 'THREAD_DELETE', {'id': '31', 'guild_id': '1'})
-    assert set(fake.hash('guild:{1}:threads')) == {'32'}
-
-    member = {'guild_id': '1', 'user': {'id': '3', 'username': 'm'}, 'roles': []}
-    await run_mirror(rc, 'GUILD_MEMBER_ADD', member)
-    assert fake.string('member:{1}:3')['user']['id'] == '3'
-    await run_mirror(rc, 'GUILD_MEMBERS_CHUNK', {'guild_id': '1', 'members': [dict(member, user={'id': '4'})]})
-    assert 'member:{1}:4' in fake.data
-    await run_mirror(rc, 'GUILD_MEMBER_REMOVE', member)
-    assert 'member:{1}:3' not in fake.data and 'user:3' in fake.data
-
-    await run_mirror(rc, 'GUILD_EMOJIS_UPDATE', {'guild_id': '1', 'emojis': [{'id': '50', 'name': 'e'}]})
-    await run_mirror(rc, 'GUILD_STICKERS_UPDATE', {'guild_id': '1', 'stickers': [{'id': '60', 'name': 's'}]})
-    assert set(fake.hash('guild:{1}:emojis')) == {'50'} and set(fake.hash('guild:{1}:stickers')) == {'60'}
-
-
-@pytest.mark.asyncio
-async def test_mirror_messages_merge_partial_update() -> None:
-    rc = redis_cache(message_ttl=120)
-    fake = await run_mirror(rc, 'MESSAGE_CREATE', MESSAGE_CREATE)
-    assert fake.ttls['message:{20}:10'] == 120
-    await run_mirror(rc, 'MESSAGE_UPDATE', {'id': '10', 'channel_id': '20', 'content': 'edited'})
-    data = await rc.get_message(20, 10)
-    assert data is not None and data['content'] == 'edited' and data['author']['id'] == '2'
-    assert await rc.get_message(20, 11) is None
-    await run_mirror(rc, 'MESSAGE_DELETE', {'id': '10', 'channel_id': '20'})
-    assert await rc.get_message(20, 10) is None
-    await run_mirror(rc, 'MESSAGE_CREATE', MESSAGE_CREATE)
-    await run_mirror(rc, 'MESSAGE_DELETE_BULK', {'ids': ['10', '11'], 'channel_id': '20'})
-    assert await rc.get_message(20, 10) is None
-
-    without = redis_cache()
-    fake = await run_mirror(without, 'MESSAGE_CREATE', MESSAGE_CREATE)
-    assert fake.data == {}
-
-
-@pytest.mark.asyncio
-async def test_redis_connect_selects_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    import redis.asyncio as aioredis
-
-    calls: List[tuple] = []
-
-    class Bad:
-        async def ping(self) -> None:
-            raise ConnectionError('nope')
-
-    def cluster_from_url(uri: str, **kwargs: Any) -> Any:
-        calls.append(('cluster', uri, kwargs))
-        return Bad() if uri.endswith('dead') else FakeRedis()
-
-    def single_from_url(uri: str, **kwargs: Any) -> Any:
-        calls.append(('single', uri, kwargs))
-        return FakeRedis()
-
-    monkeypatch.setattr(aioredis.RedisCluster, 'from_url', staticmethod(cluster_from_url))
-    monkeypatch.setattr(aioredis.Redis, 'from_url', staticmethod(single_from_url))
-
-    rc = RedisCache(RedisSettings(['redis://dead', 'redis://alive'], read_from_replicas=True, max_connections=8))
-    await rc.connect()
-    assert rc.connected and [c[0:2] for c in calls] == [('cluster', 'redis://dead'), ('cluster', 'redis://alive')]
-    assert calls[1][2]['read_from_replicas'] is True and calls[1][2]['max_connections'] == 8
-    await rc.close()
-    assert not rc.connected
-
-    calls.clear()
-    rc = RedisCache(RedisSettings('redis://one', cluster=False))
-    await rc.connect()
-    assert calls == [('single', 'redis://one', {'decode_responses': True})]
-
-    with pytest.raises(RuntimeError):
-        await RedisCache(RedisSettings('redis://dead')).connect()
-
-
-@pytest.mark.asyncio
-async def test_redis_provided_client_is_shared_not_closed() -> None:
-    fake = FakeRedis()
-    rc = RedisCache(RedisSettings(client=fake))
-    await rc.connect()
-    assert rc.client is fake
-    await rc.close()
-    assert not fake.closed and not rc.connected
-
-    holder: Dict[str, Any] = {}
-    rc = RedisCache(RedisSettings(client=lambda: holder.get('client')))
-    with pytest.raises(RuntimeError):
-        await rc.connect()
-    holder['client'] = fake
-    await rc.connect()
-    assert rc.client is fake
-
-    with pytest.raises(TypeError):
-        RedisSettings()
-    with pytest.raises(TypeError):
-        RedisSettings('redis://x', client=fake)
-
-    # end to end through the manager: writes land on the shared client
-    m = manager(CacheSettings(redis=RedisSettings(client=fake)))
-    await m.start()
-    await m.pre_event('GUILD_ROLE_CREATE', {'guild_id': '1', 'role': {'id': '1'}})
-    await m.flush()
-    assert '1' in fake.hash('guild:{1}:roles')
-    await m.close()
-    assert not fake.closed
 
 
 # ---------------------------------------------------------------------------
@@ -642,22 +336,22 @@ async def test_redis_provided_client_is_shared_not_closed() -> None:
 
 def test_manager_defaults_are_upstream() -> None:
     m = manager(None)
-    assert m.pre_event is None and m.redis is None and not m._sweeps_needed
-    assert type(m.members()) is dict and type(m.threads()) is dict
+    assert not m._sweeps_needed
+    assert type(m.members()) is dict
     assert isinstance(m.messages(), MessageCache) and manager(None, max_messages=None).messages() is None
     guild = fake_guild(1, members={5: 'm'})
     m.guild_added(guild)  # type: ignore
     assert type(guild._members) is dict
 
 
-def test_manager_swaps_containers(clock: Clock) -> None:
-    m = manager(CacheSettings(member_ttl=10, thread_max=5))
-    assert m.pre_event is None
+def test_manager_swaps_member_container(clock: Clock) -> None:
+    m = manager(CacheSettings(member_ttl=10, member_max=50))
     guild = fake_guild(1, members={5: 'm', 999: 'me'})
     m.guild_added(guild)  # type: ignore
-    assert type(guild._members) is TTLDict and guild._members._pin == 999 and guild._members.ttl == 10
-    assert type(guild._threads) is TTLDict and guild._threads.max_size == 5
+    assert type(guild._members) is TTLDict and guild._members._pin == 999
+    assert guild._members.ttl == 10 and guild._members.max_size == 50
     assert dict(guild._members) == {5: 'm', 999: 'me'} and 999 not in guild._members._ts
+    assert type(guild._threads) is dict  # threads are never bounded
 
 
 @pytest.mark.asyncio
@@ -677,67 +371,6 @@ async def test_manager_sweep_once(clock: Clock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_manager_lru_unload_and_touch(clock: Clock) -> None:
-    m = manager(CacheSettings(member_ttl=10, max_loaded_guilds=2, redis=RedisSettings('redis://x', cluster=False)))
-    state = m._state
-    guilds = {}
-    for guild_id in (1, 2, 3):
-        guild = fake_guild(guild_id, members={5: 'm', 999: 'me'})
-        state._guilds[guild_id] = guilds[guild_id] = guild
-        m.guild_added(guild)  # type: ignore
-    assert list(m._lru) == [2, 3] and not m.is_loaded(guilds[1]) and m.is_loaded(guilds[2])  # type: ignore
-    assert guilds[1]._channels == {} and guilds[1]._roles == {} and dict(guilds[1]._members) == {999: 'me'}
-    assert type(guilds[1]._members) is TTLDict
-
-    m.touch(2)
-    assert list(m._lru) == [3, 2]  # type: ignore
-    m.mark_loaded(4)
-    assert list(m._lru) == [2, 4] and 3 in m._unloaded  # type: ignore
-
-    stub = fake_guild(9, unavailable=True)
-    m.guild_added(stub)  # type: ignore
-    assert 9 not in m._lru  # type: ignore
-
-    m.forget(2)
-    assert 2 not in m._lru  # type: ignore
-    m.reset()
-    assert not m._lru and not m._unloaded  # type: ignore
-
-
-@pytest.mark.asyncio
-async def test_manager_writer_batches_flushes_and_breaks_circuit(clock: Clock, monkeypatch: pytest.MonkeyPatch) -> None:
-    m = manager(CacheSettings(redis=RedisSettings('redis://x', cluster=False, batch_size=2)))
-    assert m.pre_event is not None
-    fake = await connect_fake(m)
-    assert m._writer is not None and m._sweeper is None
-
-    for role_id in range(5):
-        await m.pre_event('GUILD_ROLE_CREATE', {'guild_id': '1', 'role': {'id': str(role_id)}})
-    await m.pre_event('MESSAGE_CREATE', MESSAGE_CREATE)  # not mirrored: message_ttl is None
-    await m.flush()
-    assert set(fake.hash('guild:{1}:roles')) == {'0', '1', '2', '3', '4'} and 'message:{20}:10' not in fake.data
-
-    fake.fail = True
-    await m.pre_event('GUILD_ROLE_CREATE', {'guild_id': '1', 'role': {'id': '9'}})
-    await m.flush()
-    assert m._redis_down_until > clock.now
-    fake.fail = False
-    await m.pre_event('GUILD_ROLE_CREATE', {'guild_id': '1', 'role': {'id': '10'}})
-    await m.flush()
-    assert '10' not in fake.hash('guild:{1}:roles')  # dropped while the circuit is open
-    clock.advance(31)
-    await m.pre_event('GUILD_ROLE_CREATE', {'guild_id': '1', 'role': {'id': '11'}})
-    await m.flush()
-    assert '11' in fake.hash('guild:{1}:roles')
-
-    await m.pre_event('GUILD_ROLE_CREATE', {'guild_id': '1', 'role': 'malformed'})  # never raises
-    await m.flush()
-
-    await m.close()
-    assert fake.closed and m._writer is None and m._queue is None
-
-
-@pytest.mark.asyncio
 async def test_manager_start_is_idempotent_and_close_stops_sweeper() -> None:
     m = manager(CacheSettings(member_ttl=1, sweep_interval=1000))
     await m.start()
@@ -749,6 +382,14 @@ async def test_manager_start_is_idempotent_and_close_stops_sweeper() -> None:
     assert sweeper.cancelled() or sweeper.done()
 
 
+@pytest.mark.asyncio
+async def test_manager_without_settings_starts_no_task() -> None:
+    m = manager(None)
+    await m.start()
+    assert m._sweeper is None
+    await m.close()
+
+
 # ---------------------------------------------------------------------------
 # Integration through a real Client / ConnectionState
 # ---------------------------------------------------------------------------
@@ -758,7 +399,6 @@ async def test_manager_start_is_idempotent_and_close_stops_sweeper() -> None:
 async def test_client_member_and_message_ttl(clock: Clock) -> None:
     client = make_client(member_ttl=10, message_ttl=10, sweep_interval=10_000)
     state = client._connection
-    assert state._cache.pre_event is None
 
     state.parse_guild_create(dict(GUILD_CREATE))  # type: ignore
     guild = client.get_guild(1)
@@ -772,6 +412,12 @@ async def test_client_member_and_message_ttl(clock: Clock) -> None:
     assert await state._cache.sweep_once() == 2
     assert guild.get_member(2) is None and state._get_message(10) is None and len(client.cached_messages) == 0
 
+    # evicted objects behave as never cached: raw events only, no crash
+    state.parse_message_delete({'id': '10', 'channel_id': '20', 'guild_id': '1'})  # type: ignore
+    state.parse_guild_member_update(  # type: ignore
+        {'guild_id': '1', 'user': MESSAGE_CREATE['author'], 'roles': [], 'flags': 0, 'joined_at': None}
+    )
+
     state.parse_message_create(dict(MESSAGE_CREATE))  # type: ignore
     state.parse_guild_delete({'id': '1'})  # type: ignore
     assert client.get_guild(1) is None and state._get_message(10) is None
@@ -782,272 +428,12 @@ async def test_client_member_and_message_ttl(clock: Clock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_client_guild_unload_and_reload_from_redis(clock: Clock) -> None:
-    client = make_client(member_ttl=10, max_loaded_guilds=1, redis=RedisSettings('redis://x', cluster=False))
+async def test_client_without_cache_option_is_upstream() -> None:
+    client = discord.Client(intents=discord.Intents.default(), max_messages=5)
     state = client._connection
-    cache = state._cache
-    fake = await connect_fake(cache)
-
-    async def gateway(event: str, data: Dict[str, Any]) -> None:
-        await cache.pre_event(event, data)
-        state.parsers[event](data)
-
-    await gateway('GUILD_CREATE', dict(GUILD_CREATE))
-    second = dict(GUILD_CREATE, id='2', channels=[dict(GUILD_CREATE['channels'][0], id='40')])
-    await gateway('GUILD_CREATE', second)
-    await cache.flush()
-
-    one, two = client.get_guild(1), client.get_guild(2)
-    assert one is not None and two is not None
-    assert not cache_mod.is_guild_loaded(one) and cache_mod.is_guild_loaded(two)
-    assert one.get_channel(20) is None and one.get_role(1) is None
-    # the bot's own member survives unloading
-    one._add_member(discord.Member._from_client_user(user=state.user, guild=one, state=state))  # type: ignore
-    cache._unload(one)
-    assert one.me is not None
-
-    await gateway('MESSAGE_CREATE', dict(MESSAGE_CREATE))
-    assert cache_mod.is_guild_loaded(one) and not cache_mod.is_guild_loaded(two)
-    assert isinstance(one.get_channel(20), discord.TextChannel) and one.get_role(1) is not None
-    message = state._get_message(10)
-    assert message is not None and isinstance(message.channel, discord.TextChannel) and one.me is not None
-
-    # Redis lost the guild: fall back to the API
-    fake.data = {k: v for k, v in fake.data.items() if not k.startswith('guild:{2}')}
-    calls: List[Any] = []
-
-    async def get_guild(guild_id: int, *, with_counts: bool = True) -> Dict[str, Any]:
-        calls.append(guild_id)
-        return {k: v for k, v in second.items() if k not in ('channels', 'members')}
-
-    async def get_all_guild_channels(guild_id: int) -> List[Dict[str, Any]]:
-        return list(second['channels'])
-
-    state.http.get_guild = get_guild  # type: ignore
-    state.http.get_all_guild_channels = get_all_guild_channels  # type: ignore
-    await gateway('MESSAGE_CREATE', dict(MESSAGE_CREATE, id='11', channel_id='40', guild_id='2'))
-    assert calls == [2] and two.get_channel(40) is not None and not cache_mod.is_guild_loaded(one)
-    await cache.flush()
-    assert 'guild:{2}' in fake.data  # re-warmed
-
-    assert await cache_mod.load_guild(two) is two
-    await cache.close()
-
-
-@pytest.mark.asyncio
-async def test_client_cached_lookups_fall_back_to_redis(clock: Clock) -> None:
-    client = make_client(redis=RedisSettings('redis://x', cluster=False, message_ttl=60))
-    state = client._connection
-    cache = state._cache
-    fake = await connect_fake(cache)
-    state.parse_guild_create(dict(GUILD_CREATE))  # type: ignore
-    guild = client.get_guild(1)
-    assert guild is not None
-
-    await cache.pre_event(
-        'GUILD_MEMBER_ADD',
-        {
-            'guild_id': '1',
-            'user': {'id': '3', 'username': 'three', 'discriminator': '0', 'avatar': None, 'global_name': None},
-            'roles': [],
-            'joined_at': None,
-            'deaf': False,
-            'mute': False,
-            'flags': 0,
-        },
-    )
-    await cache.pre_event('MESSAGE_CREATE', dict(MESSAGE_CREATE))
-    await cache.flush()
-
-    member = await cache_mod.get_cached_member(guild, 3)
-    assert member is not None and member.name == 'three' and guild.get_member(3) is None
-    user = await cache_mod.get_cached_user(client, 3)
-    assert user is not None and user.name == 'three'
-    assert await cache_mod.get_cached_user(client, 4) is None
-    message = await cache_mod.get_cached_message(client, 20, 10)
-    assert message is not None and message.content == 'hello' and message.guild is guild
-    assert await cache_mod.get_cached_message(client, 20, 11) is None
-
-    fake.fail = True
-    assert await cache_mod.get_cached_member(guild, 4) is None and cache._redis_down_until > clock.now
-    await cache.close()
-
-
-def capture_dispatch(state: Any) -> List[tuple]:
-    events: List[tuple] = []
-
-    def dispatch(event: str, *args: Any) -> None:
-        events.append((event, *args))
-
-    state.dispatch = dispatch
-    return events
-
-
-@pytest.mark.asyncio
-async def test_redis_hydrates_evicted_messages_and_members_before_events(clock: Clock) -> None:
-    client = make_client(
-        member_ttl=10, message_ttl=10, sweep_interval=10_000, redis=RedisSettings('redis://x', cluster=False, message_ttl=60)
-    )
-    state = client._connection
-    cache = state._cache
-    fake = await connect_fake(cache)
-    events = capture_dispatch(state)
-
-    async def gateway(event: str, data: Dict[str, Any]) -> None:
-        await cache.pre_event(event, data)
-        state.parsers[event](data)
-
-    await gateway('GUILD_CREATE', dict(GUILD_CREATE))
-    await gateway('MESSAGE_CREATE', dict(MESSAGE_CREATE))
-    await gateway('MESSAGE_CREATE', dict(MESSAGE_CREATE, id='11', content='second'))
-    guild = client.get_guild(1)
-    assert guild is not None and guild.get_member(2) is not None and state._get_message(10) is not None
-
-    # everything ages out of memory, Redis still has it
-    clock.advance(11)
-    await cache.sweep_once()
-    assert guild.get_member(2) is None and state._get_message(10) is None and state._get_message(11) is None
-    events.clear()
-
-    # message delete: on_message_delete fires with the full message, Redis copy is removed too
-    await gateway('MESSAGE_DELETE', {'id': '10', 'channel_id': '20', 'guild_id': '1'})
-    names = [e[0] for e in events]
-    assert names == ['raw_message_delete', 'message_delete']
-    assert events[0][1].cached_message is not None and events[1][1].content == 'hello'
-    assert isinstance(events[1][1].author, discord.Member) and events[1][1].guild is guild
-    assert state._get_message(10) is None
-    await cache.flush()
-    assert 'message:{20}:10' not in fake.data
-    events.clear()
-
-    # message edit: before/after both available
-    await gateway('MESSAGE_UPDATE', dict(MESSAGE_CREATE, id='11', content='edited'))
-    names = [e[0] for e in events]
-    assert names == ['raw_message_edit', 'message_edit']
-    before, after = events[1][1], events[1][2]
-    assert before.content == 'second' and after.content == 'edited' and state._get_message(11) is not None
-    events.clear()
-
-    # reaction without a member in the payload: message and member are both restored
-    clock.advance(11)
-    await cache.sweep_once()
-    assert guild.get_member(2) is None and state._get_message(11) is None
-    await gateway(
-        'MESSAGE_REACTION_REMOVE',
-        {
-            'message_id': '11',
-            'channel_id': '20',
-            'guild_id': '1',
-            'user_id': '2',
-            'emoji': {'id': None, 'name': 'x'},
-            'type': 0,
-            'burst': False,
-        },
-    )
-    assert [e[0] for e in events] == ['raw_reaction_remove']  # no reaction to remove yet, but no crash
-    assert guild.get_member(2) is not None and state._get_message(11) is not None
-    events.clear()
-
-    # member update after eviction: on_member_update fires with the old state
-    clock.advance(11)
-    await cache.sweep_once()
-    assert guild.get_member(2) is None
-    await gateway(
-        'GUILD_MEMBER_UPDATE',
-        {
-            'guild_id': '1',
-            'user': MESSAGE_CREATE['author'],
-            'roles': [],
-            'nick': 'renamed',
-            'joined_at': '2024-01-01T00:00:00+00:00',
-            'flags': 0,
-        },
-    )
-    assert [e[0] for e in events] == ['member_update']
-    old, new = events[0][1], events[0][2]
-    assert old.nick is None and new.nick == 'renamed' and guild.get_member(2) is new
-    events.clear()
-
-    # bulk delete after eviction
-    clock.advance(11)
-    await cache.sweep_once()
-    await gateway('MESSAGE_DELETE_BULK', {'ids': ['11', '12'], 'channel_id': '20', 'guild_id': '1'})
-    names = [e[0] for e in events]
-    assert names == ['raw_bulk_message_delete', 'bulk_message_delete']
-    assert [m.id for m in events[1][1]] == [11] and state._get_message(11) is None
-    events.clear()
-
-    # member remove after eviction: on_member_remove fires with the Member and Redis forgets it
-    clock.advance(11)
-    await cache.sweep_once()
-    assert guild.get_member(2) is None
-    await gateway('GUILD_MEMBER_REMOVE', {'guild_id': '1', 'user': MESSAGE_CREATE['author']})
-    names = [e[0] for e in events]
-    assert names == ['member_remove', 'raw_member_remove'] and isinstance(events[0][1], discord.Member)
-    assert guild.get_member(2) is None
-    await cache.flush()
-    assert 'member:{1}:2' not in fake.data
-    events.clear()
-
-    # payload that already carries the member does not touch Redis
-    executed = fake.executed
-    await gateway(
-        'MESSAGE_REACTION_ADD',
-        {
-            'message_id': '99',
-            'channel_id': '20',
-            'guild_id': '1',
-            'user_id': '3',
-            'emoji': {'id': None, 'name': 'x'},
-            'type': 0,
-            'burst': False,
-            'member': {
-                'user': {'id': '3', 'username': 'u3', 'discriminator': '0', 'avatar': None, 'global_name': None},
-                'roles': [],
-                'joined_at': None,
-                'deaf': False,
-                'mute': False,
-                'flags': 0,
-            },
-        },
-    )
-    await cache.flush()
-    assert fake.executed == executed + 1  # only the message lookup, no member GET
-    events.clear()
-
-    # Redis down: events still fire in their raw form, nothing raises
-    fake.fail = True
-    await gateway('MESSAGE_DELETE', {'id': '11', 'channel_id': '20', 'guild_id': '1'})
-    assert [e[0] for e in events] == ['raw_message_delete'] and cache._redis_down_until > clock.now
-    await cache.close()
-
-
-@pytest.mark.asyncio
-async def test_redis_member_hydration_respects_member_cache_flags() -> None:
-    client = make_client(member_ttl=10, redis=RedisSettings('redis://x', cluster=False))
-    state = client._connection
-    cache = state._cache
-    fake = await connect_fake(cache)
-    state.parse_guild_create(dict(GUILD_CREATE))  # type: ignore
-    await cache.pre_event('GUILD_CREATE', dict(GUILD_CREATE))
-    await cache.flush()
-    assert 'member:{1}:2' in fake.data
-    guild = client.get_guild(1)
-    assert guild is not None
-    guild._remove_member(guild.get_member(2))  # type: ignore
-
-    state.member_cache_flags = discord.MemberCacheFlags.none()
-    await cache.pre_event(
-        'GUILD_MEMBER_UPDATE', {'guild_id': '1', 'user': MESSAGE_CREATE['author'], 'roles': [], 'flags': 0}
-    )
-    assert guild.get_member(2) is None  # upstream would not have cached it either
-
-    state.member_cache_flags = discord.MemberCacheFlags.all()
-    await cache.pre_event(
-        'GUILD_MEMBER_UPDATE', {'guild_id': '1', 'user': MESSAGE_CREATE['author'], 'roles': [], 'flags': 0}
-    )
-    assert guild.get_member(2) is not None
-    await cache.close()
+    assert type(state._cache.members()) is dict and not state._cache._sweeps_needed
+    assert isinstance(state._messages, MessageCache) and state._messages._d.ttl is None
+    await state._cache.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1058,59 +444,36 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 FORK_MARKER = '# Maki fork: cache layer'
 # Upstream files that carry hook lines, with the number of marked lines each must have.
 FORK_MARKER_COUNTS = {
-    'discord/state.py': 10,
+    'discord/state.py': 7,
     'discord/client.py': 3,
-    'discord/gateway.py': 1,
     'discord/__init__.py': 1,
 }
-# Lookups inside parsers that the Redis tier must be able to satisfy after memory eviction.
-CACHE_LOOKUPS = {'_get_message', 'get_member', 'get_user', '_get_reaction_user'}
-# Parsers that look something up but must NOT be hydrated, with the reason.
-HYDRATE_EXEMPT = {
-    'GUILD_MEMBER_ADD': 'payload carries the member; hydrating first would make upstream discard the join',
-}
+# Upstream files that must stay byte-identical to upstream.
+UNTOUCHED_UPSTREAM = ('discord/guild.py', 'discord/gateway.py', 'discord/ext/commands/bot.py')
 
 
 def test_fork_marker_count() -> None:
     for relative, expected in FORK_MARKER_COUNTS.items():
         found = (REPO / relative).read_text().count(FORK_MARKER)
         assert found == expected, f'{relative}: expected {expected} fork markers, found {found}'
-    for relative in ('discord/guild.py', 'discord/ext/commands/bot.py'):
+    for relative in UNTOUCHED_UPSTREAM:
         assert FORK_MARKER not in (REPO / relative).read_text(), f'{relative} must stay identical to upstream'
 
 
-def _parsers_with_cache_lookups() -> Dict[str, set]:
+def test_message_cache_supports_every_state_usage() -> None:
+    """state.py uses MessageCache where upstream uses a deque. Any new attribute upstream
+    starts calling on self._messages must exist on MessageCache, or a merge breaks at runtime."""
     tree = ast.parse((REPO / 'discord/state.py').read_text())
-    result: Dict[str, set] = {}
+    used = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef) or not node.name.startswith('parse_'):
-            continue
-        lookups = {
-            child.func.attr
-            for child in ast.walk(node)
-            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) and child.func.attr in CACHE_LOOKUPS
-        }
-        if lookups:
-            result[node.name[len('parse_') :].upper()] = lookups
-    return result
-
-
-def test_hydrate_table_covers_all_cache_lookups() -> None:
-    parsers = _parsers_with_cache_lookups()
-    assert parsers, 'no parsers with cache lookups found; the scan is broken'
-    missing = {
-        event: lookups
-        for event, lookups in parsers.items()
-        if event not in cache_mod._HYDRATE and event not in HYDRATE_EXEMPT
-    }
-    assert not missing, (
-        f'parsers that read the cache but have no _HYDRATE row (add one in discord/cache.py or exempt it here): {missing}'
-    )
-    all_parsers = {
-        node.name[len('parse_') :].upper()
-        for node in ast.walk(ast.parse((REPO / 'discord/state.py').read_text()))
-        if isinstance(node, ast.FunctionDef) and node.name.startswith('parse_')
-    }
-    stale = set(cache_mod._HYDRATE) - all_parsers
-    assert not stale, f'_HYDRATE rows without a matching parse_* method in state.py: {stale}'
-    assert set(HYDRATE_EXEMPT) <= all_parsers
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == '_messages'
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == 'self'
+        ):
+            used.add(node.attr)
+    assert used, 'no self._messages.<attr> usage found; the scan is broken'
+    missing = {name for name in used if not hasattr(MessageCache, name)}
+    assert not missing, f'state.py calls these on self._messages but MessageCache lacks them: {missing}'

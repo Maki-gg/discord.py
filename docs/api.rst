@@ -5982,16 +5982,6 @@ Maki fork addition, not part of upstream discord.py.
 .. autoclass:: CacheSettings
     :members:
 
-RedisSettings
-~~~~~~~~~~~~~~
-
-Maki fork addition, not part of upstream discord.py.
-
-.. attributetable:: RedisSettings
-
-.. autoclass:: RedisSettings
-    :members:
-
 ApplicationFlags
 ~~~~~~~~~~~~~~~~~
 

@@ -601,9 +601,6 @@ class DiscordWebSocket:
         except KeyError:
             _log.debug('Unknown event %s.', event)
         else:
-            cache = self._connection._cache  # Maki fork: cache layer
-            if cache.pre_event is not None:
-                await cache.pre_event(event, data)
             func(data)
 
         # remove the dispatched listeners
