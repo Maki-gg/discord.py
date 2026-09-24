@@ -40,9 +40,6 @@ voice = [
     "PyNaCl>=1.6.0,<1.7",
     "davey>=0.1.0"
 ]
-redis = [
-    "redis>=5.0.1"
-]
 docs = [
     "sphinx==4.4.0",
     "sphinxcontrib_trio==1.1.2",
