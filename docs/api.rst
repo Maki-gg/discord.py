@@ -5779,6 +5779,14 @@ RawMemberRemoveEvent
 .. autoclass:: RawMemberRemoveEvent()
     :members:
 
+RawMemberUpdateEvent
+~~~~~~~~~~~~~~~~~~~~~~
+
+.. attributetable:: RawMemberUpdateEvent
+
+.. autoclass:: RawMemberUpdateEvent()
+    :members:
+
 RawAppCommandPermissionsUpdateEvent
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
