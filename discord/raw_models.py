@@ -514,7 +514,7 @@ class RawMemberUpdateEvent(_RawReprMixin):
     cached_member: Optional[:class:`Member`]
         The member as it was before the update, if found in the internal member cache.
     data: :class:`dict`
-        The raw data sent by the `gateway <https://discord.com/developers/docs/events/gateway-events#guild-member-update>`_.
+        The raw data sent by the :ddocs:`gateway <events/gateway-events#guild-member-update>`.
     """
 
     __slots__ = ('guild_id', 'user_id', 'member', 'cached_member', 'data')
